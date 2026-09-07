@@ -6,6 +6,46 @@ Created on Fri Aug 14 2026
 Description: Reconnection rate for a 3D double-Harris iPIC3D run, computed
              SEPARATELY for the two current sheets (CS1 = lower y, CS2 = upper y).
 
+             This version adds the PAPER-METHOD reconnection rate
+
+                 v_rec = <v_in> / v_out
+
+             (Appendix G) computed from the MASS-WEIGHTED bulk fluid velocity,
+             built from the per-species moments rho_s and J_s. It is written and
+             plotted SEPARATELY from the flux-function rate; the flux-based
+             outputs (R_rate_field_avg.txt, R_rate_plane_avg.txt, ...) are
+             untouched.
+
+Paper method as applied here (geometry of THIS code: sheet along x, normal
+along y; inflow = y, outflow = x; c=1 so v_x, v_y are already in units of c):
+
+  * v_in  : average of INFLOWING v_y (directed toward the sheet centre) over the
+            upstream band  0.3*(Ly/4) <= |y - y_centre| <= 0.8*(Ly/4)  on BOTH
+            y-sides of each sheet, scaled from the paper's 0.3..0.8 inflow box.
+  * v_out : max |v_x| over the whole (periodic) x-range within the outflow band
+            |y - y_centre| <= OUTFLOW_HALF_FRAC*(Ly/4). No x edge-guard is needed
+            because x is periodic.
+  * v_rec : <v_in> / v_out, per sheet, per cycle. Direct ratio -- no time
+            derivative, no vA, no flux function.
+
+Velocity:
+  Mass-weighted single-fluid velocity from ALL four species (paper uses the
+  fluid velocity v for non-FFE runs):
+
+      V = sum_s (m_s/q_s) J_s  /  sum_s (m_s/q_s) rho_s
+
+  With masses in electron-mass units and mass_ratio = m_i/m_e, the per-species
+  weight m_s/q_s is -1 for the two electron species (0,2) and +mass_ratio for
+  the two proton species (1,3); the common 1/e cancels between numerator and
+  denominator. This is the TRUE center-of-mass velocity, not J_total/rho_total.
+
+Species layout (fixed by the run):
+    0 = background electrons   1 = background protons
+    2 = current-sheet electrons 3 = current-sheet protons
+
+If ANY of species 0..3 is missing rho, Jx or Jy for a requested cycle, the run
+prints the offending dataset path and ABORTS (no partial result).
+
 Method
 ------
 1. Assemble the z-AVERAGED in-plane field <Bx>_z, <By>_z on the global (x,y) grid.
@@ -45,6 +85,7 @@ Usage
       $xmin $xmax $ymin $ymax $zmin $zmax \
       --nxc 768 --nyc 1536 --nzc 768 \
       --sigma 5 --time-denom 10 --mapping A \
+      --mass-ratio 1836 \
       --cycle-start 0 --cycle-end 20000 --cycle-step 500 \
       --cycle-chunk 2 --ez-smooth 21
 
@@ -54,6 +95,10 @@ Usage
                                 different x for different z.
      R_rate_field_avg.txt/.png  average the FIELD along z (<B>_z and <Ez>_z),
                                 then measure once. This is the k_z = 0 mode.
+     vrec_paper.txt/.png        PAPER-METHOD rate v_in/v_out for CS1 and CS2,
+                                from the mass-weighted species velocity. Written
+                                only if per-species moments are present; if they
+                                are requested-but-partial the run aborts.
 
   Each figure has two panels: left from B (d(Delta psi)/dt), right from Ez
   (-c[Ez_X - Ez_O], no time derivative). Four curves that should agree.
@@ -89,6 +134,39 @@ rank = comm.Get_rank()
 size = comm.Get_size()
 
 t_wall = datetime.now()
+
+
+###! ============================================================
+###! Paper-method configuration (Appendix G box fractions)
+###! ============================================================
+###! Scaled from the paper's L-normalised boxes to THIS domain. The sheet-to-
+###! boundary half-width per sheet is Ly/4 (two sheets, one per y-half). The
+###! paper's inflow box spans 0.3..0.8 of its inflow half-domain; we reuse those
+###! fractions of Ly/4. The outflow box cross-sheet half-height (~0.5 of 2.0 in
+###! the paper => 0.25) becomes OUTFLOW_HALF_FRAC of Ly/4.
+INFLOW_FRAC_LO   = 0.30      ###! inner edge of the inflow band (y), in units of Ly/4
+INFLOW_FRAC_HI   = 0.80      ###! outer edge of the inflow band (y), in units of Ly/4
+INFLOW_X_LO      = 0.20      ###! along-sheet (x) inner edge of the inflow box, in Lx
+INFLOW_X_HI      = 0.80      ###! along-sheet (x) outer edge of the inflow box, in Lx
+                             ###! Makes the inflow region a true RECTANGLE (paper
+                             ###! Fig. 17): bounded in y (0.3..0.8 Ly/4 from the
+                             ###! sheet, both sides) AND in x (0.2..0.8 Lx). A single
+                             ###! contiguous x-window, not two: here x is ALONG the
+                             ###! sheet, so the two upstream regions are the two
+                             ###! y-sides, already handled. Set 0.0/1.0 for full x.
+OUTFLOW_HALF_FRAC = 0.25     ###! outflow band half-height (y), in units of Ly/4
+OUTFLOW_X_GUARD   = 0.10     ###! drop this fraction of Lx from EACH x-end before
+                             ###! taking max|v_x|. NOTE x is PERIODIC here, so this
+                             ###! is NOT removing a boundary artifact (there is no
+                             ###! boundary in x); it only shrinks the max window and
+                             ###! can bias v_rec UP if a jet sits near x=0 or x=Lx.
+                             ###! Included per request; 0.0 recovers the full x-range.
+
+###! Species indices (fixed by the run). Electrons carry negative charge, so the
+###! mass-per-charge weight m_s/q_s is negative for them; protons positive.
+SPECIES_ELECTRON = (0, 2)    ###! background + current-sheet electrons
+SPECIES_PROTON   = (1, 3)    ###! background + current-sheet protons
+ALL_SPECIES      = (0, 1, 2, 3)
 
 
 ###! ============================================================
@@ -441,6 +519,186 @@ def assemble_chunk(cycles, local_files, pid_to_ijk, tile_shape,
 
 
 ###! ============================================================
+###! Assembly:  z-averaged per-species rho, Jx, Jy  ->  mass-weighted V
+###! ============================================================
+
+def assemble_velocity_chunk(cycles, local_files, pid_to_ijk, tile_shape,
+                            nxg, nyg, nzg, exclude_last_z, mass_ratio,
+                            work_dtype):
+    """
+    Build the z-AVERAGED mass-weighted bulk velocity Vx, Vy on the global (x,y)
+    grid, for a CHUNK of cycles, from the per-species moments.
+
+    Accumulates, tile by tile, the mass-flux and mass-density sums
+
+        MFx = sum_s (m_s/q_s) <Jx_s>_z ,   Mrho = sum_s (m_s/q_s) <rho_s>_z
+
+    with m_s/q_s = -1 for electrons (species 0,2) and +mass_ratio for protons
+    (species 1,3); the common 1/e cancels in Vx = MFx/Mrho. Same z-average path
+    and coverage bookkeeping as assemble_chunk, so V co-locates with <B>_z.
+
+    ABORT policy: if a requested per-species dataset is missing on a tile that
+    owns z-planes for a present cycle, the offending path is recorded and the
+    whole run aborts collectively -- a partial mass sum would be silently wrong.
+    Returns on rank 0: dict(Vx, Vy, found, ntiles); None on other ranks.
+    """
+    nx_t, ny_t, nz_t = tile_shape
+    nx_c, ny_c, nz_c = nx_t - 1, ny_t - 1, nz_t - 1
+    nc = len(cycles)
+
+    locMFx = np.zeros((nc, nxg, nyg), dtype=work_dtype)     ###! sum_s w_s <Jx_s>_z (unnormalised)
+    locMFy = np.zeros((nc, nxg, nyg), dtype=work_dtype)     ###! sum_s w_s <Jy_s>_z
+    locMrho = np.zeros((nc, nxg, nyg), dtype=work_dtype)    ###! sum_s w_s <rho_s>_z
+    loccnt = np.zeros((nxg, nyg), dtype=np.int32)
+    locfound = np.zeros(nc, dtype=np.int32)
+    locfail = np.zeros(1, dtype=np.int32)
+    loctiles = np.zeros(1, dtype=np.int32)
+
+    ###! per-species mass-per-charge weight (electron mass units, 1/e dropped)
+    def species_weight(s):
+        if s in SPECIES_ELECTRON:
+            return -1.0
+        if s in SPECIES_PROTON:
+            return float(mass_ratio)
+        raise RuntimeError(f"Species {s} is neither electron nor proton in the layout.")
+
+    missing_path = [None]      ###! first missing dataset path seen on this rank
+
+    for fp in local_files:
+        pid = proc_id_from_filename(fp)
+        i, j, k = pid_to_ijk(pid)
+
+        xs = 0 if i == 0 else 1
+        ys = 0 if j == 0 else 1
+        zs = 0 if k == 0 else 1
+
+        gx0 = i * nx_c + xs
+        gy0 = j * ny_c + ys
+        gz0 = k * nz_c + zs
+
+        nx_use = nx_t - xs
+        ny_use = ny_t - ys
+        nz_use = nz_t - zs
+
+        gz1 = gz0 + nz_use
+        if exclude_last_z:
+            gz1 = min(gz1, nzg - 1)
+        nz_take = gz1 - gz0
+        if nz_take <= 0:
+            continue
+
+        loctiles[0] += 1
+
+        try:
+            with h5py.File(fp, "r") as f:
+                for ci, cyc in enumerate(cycles):
+                    ###! presence is defined by the field Bx of this cycle (same
+                    ###! test assemble_chunk uses); if the cycle is absent here we
+                    ###! simply skip it, exactly as the field pass does.
+                    if f"fields/Bx/{cyc}" not in f:
+                        continue
+
+                    ###! accumulate the mass-flux / mass-density sums for this cycle
+                    for s in ALL_SPECIES:
+                        w = species_weight(s)
+                        p_rho = f"moments/species_{s}/rho/{cyc}"
+                        p_jx  = f"moments/species_{s}/Jx/{cyc}"
+                        p_jy  = f"moments/species_{s}/Jy/{cyc}"
+                        for pth in (p_rho, p_jx, p_jy):
+                            if pth not in f:
+                                missing_path[0] = f"{os.path.basename(fp)}:{pth}"
+                                raise KeyError(missing_path[0])
+
+                        rho = np.asarray(f[p_rho][xs:, ys:, zs:zs + nz_take], dtype=np.float64)
+                        jx  = np.asarray(f[p_jx][xs:, ys:, zs:zs + nz_take], dtype=np.float64)
+                        jy  = np.asarray(f[p_jy][xs:, ys:, zs:zs + nz_take], dtype=np.float64)
+
+                        locMrho[ci, gx0:gx0 + nx_use, gy0:gy0 + ny_use] += w * rho.sum(axis=2)
+                        locMFx[ci, gx0:gx0 + nx_use, gy0:gy0 + ny_use] += w * jx.sum(axis=2)
+                        locMFy[ci, gx0:gx0 + nx_use, gy0:gy0 + ny_use] += w * jy.sum(axis=2)
+
+                    locfound[ci] += 1
+        except KeyError:
+            ###! missing per-species dataset -> abort path, handled collectively below
+            locfail[0] += 1
+            break
+        except Exception as e:
+            locfail[0] += 1
+            missing_path[0] = f"{os.path.basename(fp)}: read error: {e}"
+            break
+
+        loccnt[gx0:gx0 + nx_use, gy0:gy0 + ny_use] += nz_take
+
+    ###! ---- collective abort on ANY missing per-species dataset ----
+    nfail = comm.allreduce(int(locfail[0]), op=MPI.SUM)
+    if nfail > 0:
+        ###! gather the first offending path from any rank that has one
+        all_missing = comm.gather(missing_path[0], root=0)
+        fatal = None
+        if rank == 0:
+            hits = [m for m in all_missing if m is not None]
+            first = hits[0] if hits else "unknown per-species dataset"
+            fatal = ("Per-species moment missing -- cannot build the mass-weighted "
+                     f"velocity. First offending path: {first}. Every species in "
+                     f"{ALL_SPECIES} must have rho, Jx, Jy for every requested cycle. "
+                     "Aborting rather than returning a partial (silently wrong) "
+                     "mass sum.")
+        fatal = comm.bcast(fatal, root=0)
+        raise RuntimeError(fatal)
+
+    ###! ---------------- reduce to root ----------------
+    mpi_t = MPI.FLOAT if work_dtype == np.float32 else MPI.DOUBLE
+
+    def red_f(arr):
+        out = np.zeros_like(arr) if rank == 0 else None
+        comm.Reduce([arr, mpi_t], [out, mpi_t] if rank == 0 else None,
+                    op=MPI.SUM, root=0)
+        return out
+
+    MFx = red_f(locMFx)
+    MFy = red_f(locMFy)
+    Mrho = red_f(locMrho)
+
+    cnt = np.zeros_like(loccnt) if rank == 0 else None
+    comm.Reduce([loccnt, MPI.INT], [cnt, MPI.INT] if rank == 0 else None,
+                op=MPI.SUM, root=0)
+    found = np.zeros_like(locfound) if rank == 0 else None
+    comm.Reduce([locfound, MPI.INT], [found, MPI.INT] if rank == 0 else None,
+                op=MPI.SUM, root=0)
+    ntiles = comm.allreduce(int(loctiles[0]), op=MPI.SUM)
+
+    if rank != 0:
+        return None
+
+    if cnt.min() == 0:
+        raise RuntimeError("Velocity assembly gap: some (x,y) nodes received zero "
+                           "z-planes. Check the mapping or the moment datasets.")
+
+    for ci in range(nc):
+        if 0 < found[ci] < ntiles:
+            found[ci] = -1     ###! incomplete across tiles -> invalid (matches field pass)
+
+    ###! The z-average and the mass weighting are BOTH linear, so dividing the
+    ###! summed mass-flux by the summed mass-density gives the correct z-averaged
+    ###! mass-weighted velocity: Vx = <MFx>_z / <Mrho>_z. The z-plane count cancels
+    ###! between numerator and denominator, so no explicit /cnt is needed here --
+    ###! but keep it explicit for clarity and to guard non-uniform coverage.
+    MFx /= cnt[None, :, :]
+    MFy /= cnt[None, :, :]
+    Mrho /= cnt[None, :, :]
+
+    ###! Vx, Vy = mass-flux / mass-density. Mrho is the mass density (>0 where any
+    ###! plasma is present); it can approach 0 only in a true vacuum, which does
+    ###! not occur in these runs. Guard anyway.
+    rho_floor = 1e-30
+    safe = np.abs(Mrho) > rho_floor
+    Vx = np.where(safe, MFx / Mrho, 0.0)
+    Vy = np.where(safe, MFy / Mrho, 0.0)
+
+    return dict(Vx=Vx, Vy=Vy, found=found, ntiles=ntiles)
+
+
+###! ============================================================
 ###! Flux function and neutral-line extraction
 ###! ============================================================
 
@@ -454,7 +712,6 @@ def _cumtrapz0(y, d, axis):
     pad = list(y.shape)
     pad[axis] = 1
     return np.concatenate([np.zeros(pad), c], axis=axis)
-
 
 
 def psi_hessian_fft(psi, dx, dy, nxc, nyc):
@@ -883,6 +1140,97 @@ def measure_B0(Bx, c1, c2, nyg):
 
 
 ###! ============================================================
+###! Paper-method inflow/outflow sampling
+###! ============================================================
+
+def vrec_paper_one_sheet(Vx, Vy, c, quarter, nyg, nxg):
+    """
+    Paper-method (Appendix G) reconnection rate for ONE current sheet centred at
+    global y-node `c`, from the z-averaged mass-weighted velocity Vx, Vy.
+
+    Geometry of THIS code: sheet along x, normal along y. Inflow = y, outflow = x.
+
+      v_in  : mean of INFLOWING v_y over the upstream RECTANGLE
+                  INFLOW_FRAC_LO*quarter <= |y - c| <= INFLOW_FRAC_HI*quarter  (y)
+              AND INFLOW_X_LO*Lx <= x <= INFLOW_X_HI*Lx                        (x)
+              on BOTH y-sides of the sheet. "Inflowing" = v_y directed TOWARD c:
+              on the low-y side (y<c) inflow is v_y > 0; on the high-y side
+              (y>c) inflow is v_y < 0. Only inflowing-sign samples are averaged
+              (matching the paper's "taking only the inflow velocities into
+              account"); their magnitudes are combined.
+
+      v_out : max |v_x| within the outflow band |y - c| <= OUTFLOW_HALF_FRAC*quarter,
+              over the x-range with OUTFLOW_X_GUARD*Lx removed from EACH end. x is
+              periodic, so this guard removes no boundary artifact -- it only
+              shrinks the max window and can bias v_out DOWN (hence v_rec UP) if a
+              jet sits near x=0 or x=Lx. OUTFLOW_X_GUARD=0 uses the full x-range.
+
+    `quarter` = Ly/4 in NODES (the sheet-to-boundary half-width). All band edges
+    are that fraction of it, then converted to node offsets. Returns
+    (v_in, v_out, v_rec, n_in) where n_in is the count of inflowing samples
+    averaged (0 -> v_in is nan). v_rec = v_in / v_out, or nan if v_out == 0.
+    """
+    j_in_lo = int(round(INFLOW_FRAC_LO * quarter))
+    j_in_hi = int(round(INFLOW_FRAC_HI * quarter))
+    j_out   = int(round(OUTFLOW_HALF_FRAC * quarter))
+    i_guard = int(round(OUTFLOW_X_GUARD * (nxg - 1)))   ###! nxg-1 = nxc = Lx in cells
+
+    ###! y-node index of every row, and signed offset from the sheet centre.
+    ###! Bands are taken WITHOUT periodic wrap in y: the two sheets sit at Ly/4
+    ###! and 3Ly/4, and quarter = Ly/4, so |y-c| up to 0.8*quarter stays well
+    ###! inside each sheet's own half and never reaches the domain edge.
+    y = np.arange(nyg)
+    off = y - c
+
+    ###! ---- inflow: both upstream y-bands, bounded in x, inflowing sign only ----
+    ###! x-window of the inflow RECTANGLE: keep along-sheet nodes in
+    ###! [INFLOW_X_LO, INFLOW_X_HI]*Lx. nxg-1 = nxc = Lx in cells. This is the
+    ###! along-sheet bound that turns the y-band into a true rectangle (paper box).
+    ix_lo = int(round(INFLOW_X_LO * (nxg - 1)))
+    ix_hi = int(round(INFLOW_X_HI * (nxg - 1)))
+    if ix_hi <= ix_lo:                                  ###! degenerate -> full x
+        ix_lo, ix_hi = 0, nxg - 1
+
+    band_lo = (off <= -j_in_lo) & (off >= -j_in_hi)     ###! low-y side (y < c)
+    band_hi = (off >=  j_in_lo) & (off <=  j_in_hi)     ###! high-y side (y > c)
+
+    vin_samples = []
+    if band_lo.any():
+        blk = Vy[ix_lo:ix_hi + 1, band_lo]              ###! inflow here is v_y > 0
+        vin_samples.append(blk[blk > 0.0])
+    if band_hi.any():
+        blk = Vy[ix_lo:ix_hi + 1, band_hi]              ###! inflow here is v_y < 0
+        vin_samples.append(-blk[blk < 0.0])             ###! magnitude of inflowing part
+
+    if vin_samples:
+        allin = np.concatenate(vin_samples)
+    else:
+        allin = np.empty(0)
+    n_in = int(allin.size)
+    v_in = float(allin.mean()) if n_in > 0 else np.nan
+
+    ###! ---- outflow: max |v_x| over the central band, x-guarded ----
+    ###! Keep only x-nodes i_guard .. (nxg-1 - i_guard) inclusive: OUTFLOW_X_GUARD
+    ###! of Lx dropped at each end. With i_guard=0 this is the full x-range. If the
+    ###! guard is so large it would leave no interior x-nodes, fall back to the
+    ###! full range rather than return nan (a guard should never delete the signal
+    ###! entirely).
+    band_out = np.abs(off) <= j_out
+    x_hi = (nxg - 1) - i_guard
+    if 2 * i_guard >= nxg - 1:
+        x_lo, x_hi = 0, nxg - 1                          ###! guard too wide -> full range
+    else:
+        x_lo = i_guard
+    if band_out.any():
+        v_out = float(np.abs(Vx[x_lo:x_hi + 1, band_out]).max())
+    else:
+        v_out = np.nan
+
+    v_rec = v_in / v_out if (np.isfinite(v_out) and v_out > 0.0) else np.nan
+    return v_in, v_out, v_rec, n_in
+
+
+###! ============================================================
 ###! Arguments
 ###! ============================================================
 
@@ -922,17 +1270,6 @@ p.add_argument("--sigma", type=float, required=True,
                     "C++ input_param[0]. Sets vA via sqrt(s/(1+s)).")
 
 ###! --- optional enthalpy correction to the Alfven speed ---
-###! The bare sqrt(sigma/(1+sigma)) counts ION REST-MASS inertia only. The
-###! correct inertia is the enthalpy density w, which adds the electrons and
-###! the thermal contribution:
-###!
-###!     sigma_eff = sigma_i / ( <gamma_i> + <gamma_e>/R ),   R = m_i/m_e
-###!
-###! using the same mean-Lorentz formula the C++ init uses for gamma_mean_e.
-###! Impact (sigma_i = 1): 0.0% at R=1836 cold, but -18% in vA for a pair
-###! plasma (=> +22% on every rate), and -10% for hot electrons at
-###! Theta_i = 0.1. Since these runs span R = 1, 18.36, 1836, this matters.
-###! Omit them all and the old cold-ion formula is used unchanged.
 p.add_argument("--guide-field", type=float, default=0.0,
                help="Bz/B0, the guide field as a fraction of the RECONNECTING "
                     "field. Loads the outflow: vA = c sqrt(sigma/(1+sigma+sigma_g)) "
@@ -942,9 +1279,12 @@ p.add_argument("--guide-field", type=float, default=0.0,
                     "magnetisation. Default 0 recovers sqrt(sigma/(1+sigma)). "
                     "Raises R by ~6%% at b=0.5 and ~23-35%% at b=1. B0 itself is "
                     "unaffected: it is measured from the upstream Bx.")
-p.add_argument("--mass-ratio", type=float, default=None,
-               help="m_i/m_e, i.e. |qom| of the electron species. Enables the "
-                    "enthalpy correction to vA.")
+p.add_argument("--mass-ratio", type=float, default=1836.0,
+               help="m_i/m_e. Enables the enthalpy correction to vA AND sets the "
+                    "per-species mass weighting for the mass-weighted bulk velocity "
+                    "used by the paper-method rate: weight = -1 for electrons "
+                    "(species 0,2), +mass_ratio for protons (species 1,3). "
+                    "Default 1836 (real proton/electron ratio).")
 p.add_argument("--theta-i", type=float, default=None,
                help="Upstream ion thermal spread (C++ col->getUth(1)).")
 p.add_argument("--theta-e", type=float, default=None,
@@ -956,6 +1296,12 @@ p.add_argument("--time-denom", type=float, required=True,
 p.add_argument("--B0", type=float, default=None,
                help="Asymptotic upstream |Bx|. If omitted, measured from the first "
                     "valid dump midway between the sheets.")
+
+###! --- paper-method toggle ---
+p.add_argument("--no-vrec-paper", dest="vrec_paper", action="store_false",
+               help="Skip the paper-method v_in/v_out rate (which needs per-species "
+                    "moments). By default it IS computed; if the per-species moments "
+                    "are requested-but-partial the run aborts rather than guessing.")
 
 ###! --- cycles ---
 p.add_argument("--cycle-start", type=int, default=0)
@@ -1063,6 +1409,11 @@ nxg, nyg, nzg = nxc + 1, nyc + 1, nzc + 1
 ###! the CELL count, not the node count.
 dx, dy, dz = Lx / nxc, Ly / nyc, Lz / nzc
 
+###! Ly/4 in NODES: the sheet-to-boundary half-width used to scale the paper's
+###! inflow/outflow box fractions. nyg-1 = nyc nodes span Ly, so a quarter is
+###! nyc/4 cells = that many node offsets.
+quarter_nodes = nyc / 4.0
+
 def mean_lorentz(theta):
     """
     <gamma> for a Maxwell-Juttner distribution of thermal spread theta.
@@ -1084,24 +1435,6 @@ else:
                f"<g_i>={g_i:.4f}, <g_e>={g_e:.4f}")
 
 ###! ---- guide-field loading of the OUTFLOW ----
-###! The reconnecting field DRIVES the outflow; the guide field is ADVECTED
-###! with it, adding energy density without adding drive. So sigma_g belongs in
-###! the denominator only:
-###!
-###!     vA_out,g = c sqrt( sigma_up / (1 + sigma_up + sigma_g) )
-###!     sigma_g  = Bg^2/(4 pi w) = (Bg/B0)^2 * sigma_up
-###!
-###! Note this is NOT total-field magnetisation, which would put sigma_g in the
-###! numerator too. Setting --guide-field 0 (the default) recovers the ordinary
-###! sqrt(sigma/(1+sigma)).
-###!
-###! Size of the correction (R rises, since it is divided by vA):
-###!     b=0.25  ->  +1.6% (sigma=1)   +2.6% (sigma=5)
-###!     b=0.50  ->  +6.1%             +9.9%
-###!     b=1.00  -> +22.5%            +35.4%
-###! CAVEAT: vA then VARIES across a guide-field scan by construction, so R at
-###! different Bz is no longer normalised by the same speed. That is the
-###! intended physics -- the outflow really does slow -- but it must be stated.
 sigma_g = (args.guide_field ** 2) * sigma_eff
 vA = np.sqrt(sigma_eff / (1.0 + sigma_eff + sigma_g))          ###! c = 1
 if args.guide_field != 0.0:
@@ -1140,6 +1473,29 @@ if rank == 0:
             raise RuntimeError("Bx and By have different tile shapes -- fields are "
                                "not colocated; interpolation would be required.")
 
+        ###! Probe for per-species moments at the FIRST cycle. Missing here means
+        ###! the run simply lacks them: the paper rate is disabled cleanly (a
+        ###! whole-dataset absence, not the partial case that must abort).
+        HAVE_SPECIES = True
+        species_probe = None
+        for s in ALL_SPECIES:
+            for q in ("rho", "Jx", "Jy"):
+                pth = f"moments/species_{s}/{q}/{first_cycle}"
+                if pth not in f:
+                    HAVE_SPECIES = False
+                    species_probe = pth
+                    break
+            if not HAVE_SPECIES:
+                break
+        if HAVE_SPECIES:
+            ###! moment tile shape must match the field tile shape or the moment
+            ###! assembly indexing (shared with the field path) is invalid.
+            ms = tuple(f[f"moments/species_0/rho/{first_cycle}"].shape)
+            if ms != tile_shape:
+                raise RuntimeError(f"Per-species moment tile shape {ms} differs from "
+                                   f"field tile shape {tile_shape}; the shared "
+                                   f"assembly indexing would be wrong.")
+
     ###! ---- derive the MPI decomposition from cell counts + tile shape ----
     nx_t, ny_t, nz_t = tile_shape
     for lbl, n_c, n_t in (("x", nxc, nx_t), ("y", nyc, ny_t), ("z", nzc, nz_t)):
@@ -1153,8 +1509,6 @@ if rank == 0:
     YLEN = args.ylen if args.ylen is not None else nyc // (ny_t - 1)
     ZLEN = args.zlen if args.zlen is not None else nzc // (nz_t - 1)
 
-    ###! Consistency test the old positional form could never make: the derived
-    ###! decomposition must account for exactly the files on disk.
     if XLEN * YLEN * ZLEN != len(all_files):
         raise RuntimeError(
             f"Derived decomposition {XLEN}x{YLEN}x{ZLEN} = {XLEN*YLEN*ZLEN} tiles, "
@@ -1171,6 +1525,9 @@ if rank == 0:
     print(f"Decomposition   : {XLEN} x {YLEN} x {ZLEN} tiles"
           f"{' (derived)' if args.xlen is None else ' (overridden)'}"
           f"  = {XLEN*YLEN*ZLEN} files", flush=True)
+    print(f"Per-species mom : {'present' if HAVE_SPECIES else 'ABSENT'}"
+          f"{'' if HAVE_SPECIES else '  (' + str(species_probe) + ' missing)'}",
+          flush=True)
 
     if args.mapping == "auto":
         tied, map_score = infer_mapping(all_files, XLEN, YLEN, ZLEN, tile_shape)
@@ -1187,32 +1544,26 @@ else:
     all_files, tile_shape, map_name, tied = None, None, None, None
     XLEN = YLEN = ZLEN = None
     HAVE_EZ = None
+    HAVE_SPECIES = None
 
-all_files  = comm.bcast(all_files, root=0)
-tile_shape = comm.bcast(tile_shape, root=0)
-map_name   = comm.bcast(map_name, root=0)
-tied       = comm.bcast(tied, root=0)
-XLEN       = comm.bcast(XLEN, root=0)
-YLEN       = comm.bcast(YLEN, root=0)
-ZLEN       = comm.bcast(ZLEN, root=0)
-HAVE_EZ    = comm.bcast(HAVE_EZ, root=0)
+all_files    = comm.bcast(all_files, root=0)
+tile_shape   = comm.bcast(tile_shape, root=0)
+map_name     = comm.bcast(map_name, root=0)
+tied         = comm.bcast(tied, root=0)
+XLEN         = comm.bcast(XLEN, root=0)
+YLEN         = comm.bcast(YLEN, root=0)
+ZLEN         = comm.bcast(ZLEN, root=0)
+HAVE_EZ      = comm.bcast(HAVE_EZ, root=0)
+HAVE_SPECIES = comm.bcast(HAVE_SPECIES, root=0)
+
+###! Whether we will attempt the paper rate at all: requested AND present.
+do_vrec_paper = bool(args.vrec_paper and HAVE_SPECIES)
 
 all_maps = {n: fn for n, fn in mapping_candidates(XLEN, YLEN, ZLEN)}
 local_files = all_files[rank::size]
 
 ###! ---------------------------------------------------------------
 ###! Tiebreak on the DATA when occupancy cannot decide.
-###!
-###! With XLEN/YLEN/ZLEN all powers of two (64 x 2 x 64 is the case here)
-###! all six candidate mappings are perfect bijections and score 0, yet they
-###! place 98-100% of tiles differently. Picking the first would silently
-###! scramble every assembled field. The correct mapping is the one that
-###! yields a SMOOTH field across tile seams, so assemble <Bx>_z once per
-###! candidate and take the smallest total variation.
-###!
-###! Note the z-tile assignment is irrelevant to this analysis: the z-average
-###! is invariant under permutation of z-tiles. Only the (i,j) placement
-###! matters, and that is exactly what the z-averaged TV measures.
 ###! ---------------------------------------------------------------
 if map_name is None:
     if rank == 0:
@@ -1265,10 +1616,17 @@ if rank == 0:
           f"y[{args.ymin},{args.ymax}] z[{args.zmin},{args.zmax}]", flush=True)
     print(f"Box lengths     : Lx={Lx:.6g}  Ly={Ly:.6g}  Lz={Lz:.6g}", flush=True)
     print(f"Spacing         : dx={dx:.6g}  dy={dy:.6g}  dz={dz:.6g}", flush=True)
+    if do_vrec_paper:
+        print(f"Paper v_rec     : ON  (mass_ratio={args.mass_ratio:g}; inflow box "
+              f"y {INFLOW_FRAC_LO:g}-{INFLOW_FRAC_HI:g} x Ly/4, x "
+              f"{INFLOW_X_LO:g}-{INFLOW_X_HI:g} x Lx; outflow half "
+              f"{OUTFLOW_HALF_FRAC:g} x Ly/4)", flush=True)
+    elif args.vrec_paper and not HAVE_SPECIES:
+        print(f"Paper v_rec     : OFF  (per-species moments absent in the run)",
+              flush=True)
+    else:
+        print(f"Paper v_rec     : OFF  (--no-vrec-paper)", flush=True)
     if HAVE_EZ and args.ez_smooth > 1:
-        ###! Averaging N samples along the neutral line attenuates a mode of
-        ###! wavenumber k by the Dirichlet kernel sin(Nk dx/2)/(N sin(k dx/2)).
-        ###! Harmless while N << nxg, fatal once N approaches the box scale.
         kdx = 2.0 * np.pi / nxc
         att = (np.sin(args.ez_smooth * kdx / 2.0)
                / (args.ez_smooth * np.sin(kdx / 2.0)))
@@ -1301,23 +1659,12 @@ records = []            ###! rank-0 only
 zcount_used = None
 B0 = args.B0
 
-###! ============================================================
-###! Per-plane assembly: one z-tile LAYER at a time, entirely rank-local
-###! ============================================================
 
 def assemble_layer(cycles, layer, files_in_layer, pid_to_ijk, tile_shape,
                    nxg, nyg, nzg, exclude_last_z, gcomm):
     """
     GROUP-COLLECTIVE. Assemble every z-plane of one z-tile layer, for a CHUNK
     of cycles, cooperatively across the ranks of `gcomm`.
-
-    Two efficiency points over the earlier version:
-
-      * the layer's files are SPLIT across the group and Allreduced, so more
-        ranks than there are layers can be used with NO duplicated I/O;
-      * all cycles in the chunk are read per file OPEN. The files were
-        previously reopened once per cycle -- on Lustre that dominated, at
-        ~5200 opens per rank for a 41-dump, 64-layer run.
 
     Returns (Bx4, By4, Ez4, ks), each shaped (n_cycles, nxg, nyg, n_planes).
     """
@@ -1366,7 +1713,6 @@ def assemble_layer(cycles, layer, files_in_layer, pid_to_ijk, tile_shape,
                   f"{os.path.basename(fp)}: {e}", flush=True)
             break
 
-    ###! every group member needs the whole layer to analyse its share of planes
     tot = np.zeros(1, dtype=np.int32)
     gcomm.Allreduce(fail, tot, op=MPI.SUM)
     if tot[0] > 0:
@@ -1387,11 +1733,6 @@ def analyse_field(Bx, By, Ez=None, xo_tracker=None, cycle=None):
     """
     Full flux-function analysis of ONE in-plane field. Returns a record dict,
     or None if the two sheets could not be located.
-
-    Used identically for the z-averaged field and for each requested single-z
-    plane, so the two are directly comparable -- the ONLY difference is which
-    field goes in. B0 is deliberately not fixed here: it is a global upstream
-    property and is taken from the z-average for all planes.
     """
     if args.psi_method == "fft":
         psi = flux_function_fft(Bx, By, dx, dy, nxc, nyc)
@@ -1422,15 +1763,6 @@ def analyse_field(Bx, By, Ez=None, xo_tracker=None, cycle=None):
     d1, n1, L1, imax1, imin1 = dpsi_from_neutral_line(Bx_search, psi, *b1)
     d2, n2, L2, imax2, imin2 = dpsi_from_neutral_line(Bx_search, psi, *b2)
 
-    ###! INDEPENDENT rate from the electric field.
-    ###!   d(psi)/dt = -c Ez, and dpsi = psi(max) - psi(min), so
-    ###!       d(dpsi)/dt = -c [ Ez(at psi_max) - Ez(at psi_min) ]
-    ###! Verified analytically on a growing tearing mode: the two agree exactly.
-    ###! The extrema move, but grad(psi) = 0 at a critical point, so the
-    ###! advective term vanishes and no frame correction is needed.
-    ###! NOTE this is exact for the Z-AVERAGE (periodic z makes <d_z phi>_z = 0);
-    ###! at a single plane the electrostatic term does not vanish, so E_CS*
-    ###! there is only an approximation to the local reconnection field.
     if Ez is None:
         e1 = e2 = np.nan
     else:
@@ -1438,14 +1770,6 @@ def analyse_field(Bx, By, Ez=None, xo_tracker=None, cycle=None):
         e1 = -(ez_at(Ez, L1, imax1, ns) - ez_at(Ez, L1, imin1, ns))   ###! c = 1
         e2 = -(ez_at(Ez, L2, imax2, ns) - ez_at(Ez, L2, imin2, ns))
 
-    ###! ---- X/O identification check ----
-    ###! At a genuine critical point BOTH components vanish:
-    ###!   Bx = d_y psi = 0   -- true everywhere on the neutral line
-    ###!   By = -d_x psi = 0  -- true ONLY where psi is stationary ALONG it
-    ###! So |By| at the reported extremum, measured against its typical value
-    ###! along the same line, is a direct test. On an analytic island the ratio
-    ###! is ~1e-16; anything approaching 1 means the extremum is NOT a critical
-    ###! point and dpsi is not psi_X - psi_O.
     xo = {}
     if args.check_xo:
         By_sol = (-np.gradient(psi, dx, axis=0)
@@ -1488,21 +1812,9 @@ def per_plane_pass(cycles, files_by_layer, my_layers, pid_to_ijk, tile_shape,
     COLLECTIVE over COMM_WORLD. Measure-then-average over every z-plane, for a
     CHUNK of cycles at once.
 
-    Work is split twice so no rank idles:
-      * layers across GROUPS of ranks; the group's members split that layer's
-        FILES and Allreduce,
-      * planes within a layer across the members of that group.
-
-    Only per-plane RESULTS are reduced globally, never fields. Averaging the
-    FIELD first (the z-average) cancels islands sitting at different x for
-    different z; measuring each plane first cannot. On staggered synthetic
-    islands of true flux 2.00, measure-then-average gives 1.9965 at every
-    stagger while average-then-measure collapses to 0.0000 at half-box stagger.
-
     Returns {cycle_number: stats} on rank 0, {} elsewhere.
     """
     nc = len(cycles)
-    ###! n, s1, s1sq, s2, s2sq, n_e, e1sum, e2sum
     loc = np.zeros((nc, 8), dtype=np.float64)
     lo = np.full((nc, 2), np.inf)
     hi = np.full((nc, 2), -np.inf)
@@ -1518,7 +1830,6 @@ def per_plane_pass(cycles, files_by_layer, my_layers, pid_to_ijk, tile_shape,
                                            exclude_last_z, gcomm)
         if Bx4 is None:
             continue
-        ###! each group member analyses its own share of this layer's planes
         for m in range(grank, len(ks), gsize):
             for ci in range(nc):
                 r = analyse_field(Bx4[ci, :, :, m], By4[ci, :, :, m],
@@ -1530,8 +1841,6 @@ def per_plane_pass(cycles, files_by_layer, my_layers, pid_to_ijk, tile_shape,
                 loc[ci, 3] += r["d2"]; loc[ci, 4] += r["d2"]**2
                 lo[ci, 0] = min(lo[ci, 0], r["d1"]); hi[ci, 0] = max(hi[ci, 0], r["d1"])
                 lo[ci, 1] = min(lo[ci, 1], r["d2"]); hi[ci, 1] = max(hi[ci, 1], r["d2"])
-                ###! E-based rate on the same plane; counted separately so a
-                ###! missing Ez cannot poison the average
                 if np.isfinite(r.get("e1", np.nan)):
                     loc[ci, 5] += 1.0
                     loc[ci, 6] += r["e1"]; loc[ci, 7] += r["e2"]
@@ -1566,18 +1875,11 @@ def per_plane_pass(cycles, files_by_layer, my_layers, pid_to_ijk, tile_shape,
 ###! Main loop
 ###! ============================================================
 
-###! ---- per-plane-average bookkeeping ----
-###! Layers are assigned WHOLE to ranks, so each plane is owned by exactly one
-###! rank and no communication is needed to assemble it. Every file belongs to
-###! exactly one layer, so total I/O is the same as the z-average pass.
 if args.per_plane_average:
     files_by_layer = {}
     for fp in all_files:
         k = pid_to_ijk(proc_id_from_filename(fp))[2]
         files_by_layer.setdefault(k, []).append(fp)
-    ###! Split COMM_WORLD into groups. A group owns layers; its members split
-    ###! that layer's FILES (Allreduced) and then its PLANES. Every rank works
-    ###! whatever `size` is, and no file is ever read twice.
     n_groups = min(size, ZLEN)
     color = rank % n_groups
     gcomm = comm.Split(color, rank)
@@ -1591,11 +1893,11 @@ if args.per_plane_average:
 else:
     files_by_layer, my_layers, gcomm = {}, [], None
 
-###! one record list per dataset: "zavg" plus one per requested plane
 keys = ["zavg"] + [f"z{k}" for k in slice_ks]
 records = {k: [] for k in keys}
 pp_records = []          ###! per-plane-average records, rank 0
 xo_pair_records = []     ###! per-X/O-pair records, rank 0
+vrec_records = []        ###! paper-method v_rec records, rank 0
 zcount_used = None
 B0 = args.B0
 xo_tracker = {"points": {}, "next_id": {"X": 0, "O": 0}, "pairs": {},
@@ -1611,15 +1913,21 @@ for c0 in range(0, len(cycles_all), args.cycle_chunk):
     out = assemble_chunk(names, local_files, pid_to_ijk, tile_shape,
                          nxg, nyg, nzg, exclude_last_z, slice_ks, work_dtype)
 
-    ###! COLLECTIVE: every rank must enter this, so it sits before the
+    ###! COLLECTIVE: every rank must enter these, so they sit before the
     ###! rank-0-only analysis below.
     pp_chunk = {}
     if args.per_plane_average:
-        ###! whole chunk in ONE pass, so each layer file is opened once per
-        ###! CHUNK instead of once per cycle
         pp_chunk = per_plane_pass(names, files_by_layer, my_layers, pid_to_ijk,
                                   tile_shape, nxg, nyg, nzg, exclude_last_z,
                                   gcomm)
+
+    ###! COLLECTIVE: mass-weighted velocity for the paper rate. Aborts inside on
+    ###! any missing per-species dataset, so every rank calls it together.
+    vel = None
+    if do_vrec_paper:
+        vel = assemble_velocity_chunk(names, local_files, pid_to_ijk, tile_shape,
+                                      nxg, nyg, nzg, exclude_last_z,
+                                      args.mass_ratio, work_dtype)
 
     if rank != 0:
         continue
@@ -1627,14 +1935,12 @@ for c0 in range(0, len(cycles_all), args.cycle_chunk):
     zcount_used = out["zcount"]
 
     for ci, cyc in enumerate(chunk):
-        ###! 0 = absent everywhere; -1 = present in only some tiles
         if out["found"][ci] <= 0:
             why = ("dataset absent" if out["found"][ci] == 0
                    else "incomplete across tiles")
             print(f"  cycle_{cyc}: {why}, skipped", flush=True)
             continue
 
-        ###! ---- z-averaged field first; it also fixes B0 ----
         rec = analyse_field(out["Bx"][ci], out["By"][ci],
                             out["Ez"][ci] if out["Ez"] is not None else None,
                             xo_tracker=xo_tracker, cycle=cyc)
@@ -1664,6 +1970,21 @@ for c0 in range(0, len(cycles_all), args.cycle_chunk):
                                         dpsi=pair["dpsi"],
                                         ddpsi_dt=pair["ddpsi_dt"]))
 
+        ###! ---- paper-method v_rec, using the SAME sheet centres c1,c2 ----
+        if vel is not None and vel["found"][ci] > 0:
+            Vx = vel["Vx"][ci]; Vy = vel["Vy"][ci]
+            vin1, vout1, vr1, nin1 = vrec_paper_one_sheet(Vx, Vy, rec["y1"],
+                                                          quarter_nodes, nyg, nxg)
+            vin2, vout2, vr2, nin2 = vrec_paper_one_sheet(Vx, Vy, rec["y2"],
+                                                          quarter_nodes, nyg, nxg)
+            vrec_records.append(dict(cycle=cyc, t=cyc / args.time_denom,
+                                     y1=rec["y1"], y2=rec["y2"],
+                                     vin1=vin1, vout1=vout1, vrec1=vr1, nin1=nin1,
+                                     vin2=vin2, vout2=vout2, vrec2=vr2, nin2=nin2))
+        elif vel is not None:
+            print(f"  cycle_{cyc}: velocity incomplete across tiles, "
+                  f"paper v_rec skipped for this cycle", flush=True)
+
         if cyc in pp_chunk:
             ppr = pp_chunk[cyc]
             ppr.update(cycle=cyc, t=cyc / args.time_denom,
@@ -1671,7 +1992,6 @@ for c0 in range(0, len(cycles_all), args.cycle_chunk):
                        C2=rec["d2"]/ppr["m2"] if ppr["m2"] > 0 else np.nan)
             pp_records.append(ppr)
 
-        ###! ---- each requested single-z plane, same pipeline ----
         for m, gk in enumerate(slice_ks):
             r = analyse_field(out["Bxs"][m][ci], out["Bys"][m][ci])
             if r is None:
@@ -1687,28 +2007,13 @@ for c0 in range(0, len(cycles_all), args.cycle_chunk):
 ###! ============================================================
 
 def make_plot(d, path, what):
-    """
-    One figure, one panel: the reconnection rate for CS1 and CS2.
-
-        R = (1/(B0 vA)) d(Delta psi)/dt
-
-    Delta psi is psi_X - psi_O for the dominant island, so d(Delta psi)/dt is
-    the reconnection electric field at that X-line -- the quantity the
-    R ~ 0.1 benchmark refers to. A zero line is drawn because the SIGN is
-    meaningful: negative means the flux is shrinking (island merging or a
-    decaying seeded perturbation), not reconnection running backwards. Do not
-    plot |R| -- rectifying zero-mean noise manufactures a spurious steady
-    rate of 0.798*sigma.
-    """
+    """One figure, one panel: the flux-function reconnection rate for CS1 and CS2."""
     if not HAVE_MPL:
         return None
 
     ylab = d.get("ylab", r"$R = \dot{\Delta\psi}\,/\,(B_0 v_A)$")
     has_E = "E1" in d and np.any(np.isfinite(d["E1"]))
 
-    ###! Two panels only when an INDEPENDENT Ez measurement exists (the
-    ###! z-average). sharey puts both on one scale so any offset between the
-    ###! two routes is read directly off the figure rather than inferred.
     if has_E:
         fig, axes = plt.subplots(1, 2, figsize=(13.0, 4.8), sharey=True)
         panels = [(axes[0], d["R1"], d["R2"], r"from $\mathbf{B}$:  $d(\Delta\psi)/dt$"),
@@ -1718,13 +2023,11 @@ def make_plot(d, path, what):
         axes = [ax1]
         panels = [(ax1, d["R1"], d["R2"], None)]
 
-    ###! identical colour and line style in both panels, so the eye compares
-    ###! CS1-to-CS1 and CS2-to-CS2 across the pair
     for a, y1, y2, sub in panels:
         a.axhline(0.0, color="k", lw=0.8)
         a.plot(d["t"], y1, "-", color="C0", lw=1.6, label="CS1")
         a.plot(d["t"], y2, "-", color="C3", lw=1.6, label="CS2")
-        a.set_xlabel(r"$t\,\omega_p^{-1}$", fontsize=13)
+        a.set_xlabel(r"$t\,\omega_p$", fontsize=13)
         a.grid(alpha=0.3)
         a.legend(fontsize=11)
         if sub:
@@ -1742,6 +2045,28 @@ def make_plot(d, path, what):
     return path
 
 
+def make_vrec_plot(d, path):
+    """
+    Paper-method rate v_rec = v_in/v_out vs time, CS1 and CS2. A zero line is
+    drawn: v_rec is a ratio of a signed-then-magnitude inflow to a positive
+    outflow, so it is >= 0 by construction, but the line marks where inflow
+    vanishes. No |.| is taken.
+    """
+    if not HAVE_MPL:
+        return None
+    fig, ax = plt.subplots(figsize=(8.5, 4.8))
+    ax.axhline(0.0, color="k", lw=0.8)
+    ax.plot(d["t"], d["vr1"], "-", color="C0", lw=1.6, label="CS1")
+    ax.plot(d["t"], d["vr2"], "-", color="C3", lw=1.6, label="CS2")
+    ax.set_xlabel(r"$t\,\omega_p^{-1}$", fontsize=13)
+    ax.set_ylabel(r"$v_{\rm rec} = \langle v_{\rm in}\rangle / v_{\rm out}$", fontsize=13)
+    ax.legend(fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def write_table(recs, path, what):
     """Differentiate Delta psi in time, then write the table."""
     recs.sort(key=lambda r: r["cycle"])
@@ -1749,10 +2074,7 @@ def write_table(recs, path, what):
     d1 = np.array([r["d1"] for r in recs])
     d2 = np.array([r["d2"] for r in recs])
 
-    ###! np.gradient: 2nd order interior, 1st order at the two endpoints
     R1, R2 = np.gradient(d1, t)/norm, np.gradient(d2, t)/norm
-    ###! E-based rate: no time derivative at all, so it is an INDEPENDENT
-    ###! measurement of the same quantity, not a re-processing of dpsi.
     E1 = np.array([r.get("e1", np.nan) for r in recs])/norm
     E2 = np.array([r.get("e2", np.nan) for r in recs])/norm
 
@@ -1812,6 +2134,57 @@ def write_table(recs, path, what):
     return dict(t=t, d1=d1, d2=d2, R1=R1, R2=R2, E1=E1, E2=E2)
 
 
+def write_vrec_paper(recs, path):
+    """
+    Paper-method table: v_in, v_out, v_rec for CS1 and CS2 at every cycle. No
+    time derivative and no vA normalisation -- v_rec is the raw ratio
+    <v_in>/v_out defined in Appendix G. Returns arrays for plotting.
+    """
+    recs.sort(key=lambda r: r["cycle"])
+    t = np.array([r["t"] for r in recs])
+    vr1 = np.array([r["vrec1"] for r in recs])
+    vr2 = np.array([r["vrec2"] for r in recs])
+
+    with open(path, "w") as fh:
+        fh.write("# Reconnection rate -- PAPER METHOD (Appendix G): v_rec = <v_in>/v_out\n")
+        fh.write(f"# dir            = {args.dir_data}\n")
+        fh.write(f"# cells          = {nxc} x {nyc} x {nzc}   mapping = {map_name}\n")
+        fh.write(f"# extents        = x[{args.xmin},{args.xmax}] "
+                 f"y[{args.ymin},{args.ymax}] z[{args.zmin},{args.zmax}]\n")
+        fh.write(f"# time           = cycle / {args.time_denom}   [omega_p^-1]\n")
+        fh.write(f"# mass_ratio     = {args.mass_ratio:g}  "
+                 f"(electron species {SPECIES_ELECTRON}, proton species {SPECIES_PROTON})\n")
+        fh.write("# velocity       = mass-weighted single-fluid V = sum_s (m_s/q_s) J_s\n")
+        fh.write("#                  / sum_s (m_s/q_s) rho_s, z-averaged. c = 1.\n")
+        fh.write(f"# inflow box     = y: {INFLOW_FRAC_LO:g}..{INFLOW_FRAC_HI:g} x (Ly/4) "
+                 f"from each sheet (BOTH sides); x: {INFLOW_X_LO:g}..{INFLOW_X_HI:g} x Lx; "
+                 f"inflowing v_y only (mean)\n")
+        fh.write(f"# outflow band   = |y - y_cs| <= {OUTFLOW_HALF_FRAC:g} x (Ly/4), "
+                 f"v_out = max|v_x|\n")
+        fh.write(f"# outflow x-guard = {OUTFLOW_X_GUARD:g} x Lx dropped from EACH x-end "
+                 f"before the max (x is periodic, so this is not a boundary guard)\n")
+        fh.write("#\n")
+        fh.write("# geometry: sheet along x, normal along y. INFLOW = y, OUTFLOW = x.\n")
+        fh.write("# v_in_CS*   mean inflowing |v_y| in the upstream band (both sides)\n")
+        fh.write("# v_out_CS*  max |v_x| in the outflow band\n")
+        fh.write("# vrec_CS*   = v_in / v_out  (dimensionless; NO time derivative, NO vA)\n")
+        fh.write("# nin_CS*    number of inflowing samples averaged for v_in\n")
+        fh.write("#\n")
+        fh.write("# {:>8s} {:>11s} {:>6s} {:>6s} {:>14s} {:>14s} {:>14s} {:>8s} "
+                 "{:>14s} {:>14s} {:>14s} {:>8s}\n".format(
+                     "cycle", "time", "y_cs1", "y_cs2",
+                     "v_in_CS1", "v_out_CS1", "vrec_CS1", "nin1",
+                     "v_in_CS2", "v_out_CS2", "vrec_CS2", "nin2"))
+        for r in recs:
+            fh.write("  {:>8d} {:>11.4f} {:>6d} {:>6d} {:>14.6e} {:>14.6e} {:>14.6e} "
+                     "{:>8d} {:>14.6e} {:>14.6e} {:>14.6e} {:>8d}\n".format(
+                         r["cycle"], r["t"], r["y1"], r["y2"],
+                         r["vin1"], r["vout1"], r["vrec1"], r["nin1"],
+                         r["vin2"], r["vout2"], r["vrec2"], r["nin2"]))
+
+    return dict(t=t, vr1=vr1, vr2=vr2)
+
+
 def write_xo_pair_rates(recs, path):
     """Write the signed reconnection rate for every active X-O pair."""
     with open(path, "w") as fh:
@@ -1838,18 +2211,7 @@ def write_xo_pair_rates(recs, path):
 
 
 def write_xo(recs, path):
-    """
-    X/O verification table. Two independent tests per sheet:
-
-      byN   |By| at the extremum / mean |By| along the line.  Must be << 1.
-            At a true critical point By = -d_x psi = 0, so this ratio is
-            ~1e-16 for an analytic island. Approaching 1 means the max/min
-            is NOT a stationary point and dpsi is not psi_X - psi_O.
-
-      ezN   Ez at each point SEPARATELY. In a frame where the island centre
-            is ideal, Ez(O) ~ 0 while Ez(X) carries the whole reconnection
-            field. If both are comparable, the pair is not an X-O pair.
-    """
+    """X/O verification table."""
     recs = [r for r in recs if r.get("xo")]
     if not recs:
         return None
@@ -1897,14 +2259,11 @@ def write_planeavg(recs, path):
     m1 = np.array([r["m1"] for r in recs])
     m2 = np.array([r["m2"] for r in recs])
 
-    ###! 'total' = sum over planes * dz = mean * Lz. A positive constant factor,
-    ###! so every qualitative feature of the curve is unchanged.
     s1 = np.array([r["s1"] for r in recs]); s2 = np.array([r["s2"] for r in recs])
     l1 = np.array([r["lo1"] for r in recs]); h1 = np.array([r["hi1"] for r in recs])
     l2 = np.array([r["lo2"] for r in recs]); h2 = np.array([r["hi2"] for r in recs])
 
     if args.z_reduce == "total":
-        ###! scale the flux AND its spread/extremes so the columns stay consistent
         f = Lz
         m1, m2, s1, s2 = m1*f, m2*f, s1*f, s2*f
         l1, h1, l2, h2 = l1*f, h1*f, l2*f, h2*f
@@ -1913,7 +2272,6 @@ def write_planeavg(recs, path):
         qty, unit = "mean_dpsi", "  [dimensionless rate]"
 
     R1, R2 = np.gradient(m1, t)/norm, np.gradient(m2, t)/norm
-    ###! E-based rate, averaged over planes the same way. No time derivative.
     E1 = np.array([r.get("e1", np.nan) for r in recs])/norm
     E2 = np.array([r.get("e2", np.nan) for r in recs])/norm
 
@@ -1964,7 +2322,6 @@ def write_planeavg(recs, path):
     ylab = (r"$\dot{\Phi}_{\rm tot}/(B_0 v_A)$   [$\times L_z$ of the mean]"
             if args.z_reduce == "total"
             else r"$R = \dot{\Delta\psi}\,/\,(B_0 v_A)$")
-    ###! d1/d2 aliases so the summary block can treat this like the others
     return dict(t=t, R1=R1, R2=R2, E1=E1, E2=E2, m1=m1, m2=m2,
                 d1=m1, d2=m2, ylab=ylab,
                 C1=np.array([r["C1"] for r in recs]),
@@ -1995,18 +2352,28 @@ if rank == 0:
         if pf:
             print(f"Wrote {pf}", flush=True)
 
+    ###! ---- paper-method v_rec output ----
+    if do_vrec_paper:
+        if len(vrec_records) >= 1:
+            fvr = os.path.join(args.outdir, "R_rate.txt")
+            vsum = write_vrec_paper(vrec_records, fvr)
+            print(f"Wrote {fvr}", flush=True)
+            if args.plot and len(vrec_records) >= 2:
+                pf = make_vrec_plot(vsum, os.path.join(args.outdir, "R_rate.png"))
+                if pf:
+                    print(f"Wrote {pf}", flush=True)
+        else:
+            print("  Paper v_rec: no valid cycles produced a measurement, "
+                  "nothing written.", flush=True)
+
     if args.check_xo:
         fx = write_xo(records["zavg"], os.path.join(args.outdir, "xo_check.txt"))
         if fx:
-            ###! Judge only where there IS an island. When dpsi is tiny, psi is
-            ###! flat along the neutral line and the max/min are picking noise --
-            ###! the ratio is then meaningless, not a failure.
             rr = [r for r in records["zavg"] if r.get("xo")]
             dd = np.array([r["d1"] for r in rr])
             keep = dd > 0.10 * np.nanmax(dd)
             bb = np.array([[r["xo"].get("bymax1", np.nan),
                             r["xo"].get("bymin1", np.nan)] for r in rr])[keep].ravel()
-            ###! floor set by locating the extremum to ~one cell
             floor = 2.0 * np.pi / nxc
             med = np.nanmedian(bb); p90 = np.nanpercentile(bb, 90)
             print(f"Wrote {fx}", flush=True)
@@ -2062,7 +2429,6 @@ if rank == 0:
             if pf:
                 print(f"Wrote {pf}", flush=True)
 
-    ###! ---- plane-to-plane spread: how 3D is this run? ----
     if len(summ) > 1:
         print("\n" + "=" * 66)
         print("PLANE-TO-PLANE COMPARISON (rate R, CS1 and CS2)")

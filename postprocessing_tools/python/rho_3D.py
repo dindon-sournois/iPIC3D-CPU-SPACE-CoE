@@ -12,26 +12,6 @@
 
     Cache written: <outdir>/spectra_sf_cache.npz  (override with --cache-name).
 
-    WHAT IS CACHED (CS-averaged = 0.5*(CS1 + CS2), per cycle):
-        spectra   : Ex_B, Ez_B, Ex_dB, Ez_dB           each (n_cyc, n_kbins)
-        SF moments: SF{n}_{B,dB}_{x,y,z} for n in (2,4,8)
-                    each (n_cyc, n_lags), stored as the RAW moment <|df|^n>
-                    (NOT rooted) so any root/exponent is taken at plot time.
-        axes      : kc_x, valid_x, kc_z, valid_z,
-                    lags_x, lags_y, lags_z  (in CELLS), dx, dy, dz,
-                    cycles, times
-        meta      : SF_ORDERS, CS_SLABS, grid, box, mapping
-
-    ###! HIGH-ORDER CAVEAT (recorded in the cache header too):
-    ###!   SF4 and especially SF8 are dominated by the LARGEST increments, so
-    ###!   (a) they converge slowly -- the largest-lag SF8 on a thin slab can be
-    ###!       noisy cycle-to-cycle, and
-    ###!   (b) the dB = B - <B>_xz(y) mean-field OVER-subtracts near a rippled
-    ###!       sheet, injecting spurious large increments that SF8 amplifies.
-    ###!   Treat high-n dB SFs near the sheet / at large lag with caution.
-
-    DOMAIN, dB, spectra and SF definitions are exactly as in the single-stage
-    Spectra.py; see the physics notes there.
 """
 
 import os
@@ -50,12 +30,22 @@ rank = comm.Get_rank()
 size = comm.Get_size()
 
 ###! ------------------------------------------------------------------
-COMPONENTS = ["Bx", "By", "Bz"]
-DT             = 0.1
-TIME_PER_CYCLE = DT
+COMPONENTS = ["Bx", "By", "Bz"]        ###! magnetic vector components (dB)
 CS_SLABS   = [(0.2, 0.3), (0.7, 0.8)]
 SF_ORDERS  = (4,)                      ###! raw moment <|df|^4> cached (even order)
 SF_MIN_LAG_CELLS = 1
+
+###! ------------------------------------------------------------------
+###! Species groupings (0-indexed), matching rho_CS.py / B_J.py conventions.
+###! Each group is SUMMED in real space (sum-then-FFT) to form the group fluid
+###! moment before the fluctuation and spectrum are taken.
+ELECTRONS = [0, 2]
+PROTONS   = [1, 3]
+
+###! Scalar per-species moment datasets we spectrally analyse. name -> h5 leaf.
+###! Group tag ("e"/"p") x quantity ("Jz"/"rho") -> the five scalar dfields are
+###! built from these; dB is handled separately as the magnetic vector.
+SCALAR_QTYS = ["Jz", "rho"]           ###! read moments/species_{s}/{Jz,rho}/...
 
 comm.Barrier()
 
@@ -128,16 +118,31 @@ def global_shape_shared(tile_shape, XLEN, YLEN, ZLEN):
     return (XLEN * (nx - 1) + 1, YLEN * (ny - 1) + 1, ZLEN * (nz - 1) + 1)
 
 
+###! ------------------------------------------------------------------
+###! Generic slab assembler. `datasets` maps an output KEY -> the in-file HDF5
+###! path TEMPLATE (a format string taking cycle_name). All requested keys are
+###! assembled together on the same (x,z) x y-slab grid and averaged over the
+###! shared-boundary duplicate planes, so the HDF5 is opened ONCE per tile.
+###!
+###! For per-species SCALARS (Jz, rho) we DO NOT sum here -- each species is a
+###! separate key, and the caller sums the group AFTER assembly (real space),
+###! which is identical to summing before assembly but keeps this routine field
+###! -agnostic. Vector B keeps its three component keys too.
+###! ------------------------------------------------------------------
+
 def assemble_slab(cycle_name, local_files, rank_to_ijk, tile_shape,
-                  G_shape, jlo, jhi):
-    """COLLECTIVE. Assemble Bx,By,Bz on (x,z) over y-slab [jlo,jhi); reduce to
-    rank 0. Returns dict comp->(Gx,ny_slab,Gz) on rank 0, else None."""
+                  G_shape, jlo, jhi, datasets):
+    """COLLECTIVE. Assemble every field in `datasets` on (x,z) over y-slab
+    [jlo,jhi); reduce to rank 0. `datasets` is {key: path_template}, where
+    path_template.format(cycle=cycle_name) gives the HDF5 dataset path.
+    Returns {key: (Gx, ny_slab, Gz)} on rank 0, else None."""
     Gx, Gy, Gz = G_shape
     nx_t, ny_t, nz_t = tile_shape
     nx_c, ny_c, nz_c = nx_t - 1, ny_t - 1, nz_t - 1
     ny_slab = jhi - jlo
 
-    local = {c: np.zeros((Gx, ny_slab, Gz), dtype=np.float64) for c in COMPONENTS}
+    keys = list(datasets.keys())
+    local = {k: np.zeros((Gx, ny_slab, Gz), dtype=np.float64) for k in keys}
     cnt = np.zeros((Gx, ny_slab, Gz), dtype=np.float64)
 
     for fp in local_files:
@@ -158,34 +163,39 @@ def assemble_slab(cycle_name, local_files, rank_to_ijk, tile_shape,
         ny_read = je - js
 
         with h5py.File(fp, "r") as f:
-            for comp in COMPONENTS:
-                path = f"fields/{comp}/{cycle_name}"
+            for key, tmpl in datasets.items():
+                path = tmpl.format(cycle=cycle_name)
                 if path not in f:
                     raise KeyError(
                         f"Missing dataset {path} in {os.path.basename(fp)}")
                 blk = np.asarray(f[path][xs:, js:je, zs:], dtype=np.float64)
-                local[comp][gx0:gx0+nxu, oy:oy+ny_read, gz0:gz0+nzu] += blk
+                local[key][gx0:gx0+nxu, oy:oy+ny_read, gz0:gz0+nzu] += blk
         cnt[gx0:gx0+nxu, oy:oy+ny_read, gz0:gz0+nzu] += 1.0
 
-    for comp in COMPONENTS:
-        comm.Allreduce(MPI.IN_PLACE, local[comp], op=MPI.SUM)
+    for key in keys:
+        comm.Allreduce(MPI.IN_PLACE, local[key], op=MPI.SUM)
     comm.Allreduce(MPI.IN_PLACE, cnt, op=MPI.SUM)
 
     if rank != 0:
         return None
     ok = cnt > 0
-    for comp in COMPONENTS:
-        local[comp][ok] /= cnt[ok]
+    for key in keys:
+        local[key][ok] /= cnt[ok]
     if not ok.all():
         print(f"  WARNING: {int((~ok).sum())} slab nodes never written at "
               f"{cycle_name}", flush=True)
     return local
 
 
-def fluctuation_slab(slab):
-    """dB = B - <B>_xz(y)."""
+def fluctuation_vec(slab):
+    """dB = B - <B>_xz(y) for the magnetic VECTOR (dict of 3 components)."""
     return {c: slab[c] - slab[c].mean(axis=(0, 2), keepdims=True)
             for c in COMPONENTS}
+
+
+def fluctuation_scalar(arr):
+    """df = f - <f>_xz(y) for a single SCALAR slab array (Gx, ny_slab, Gz)."""
+    return arr - arr.mean(axis=(0, 2), keepdims=True)
 
 
 def build_axis_binning(n, L):
@@ -203,15 +213,74 @@ def build_axis_binning(n, L):
     return idx, n_bins, kc, valid
 
 
-def inplane_directional_spectrum(field, axis_lbl, idx, n_bins):
+def build_radial_binning(nx, nz, Lx, Lz):
+    """2D annular (isotropic) binning over k_perp = sqrt(kx^2 + kz^2).
+
+    ###! REQUIRES A SQUARE GRID: Delta kx = Delta kz (i.e. Lx/nx == Lz/nz), so
+    ###! that physical |k| is proportional to the integer index radius and a
+    ###! single integer-radius bin is a true constant-|k| annulus. This run
+    ###! family has Lx = Lz and nx_fft = nz_fft; a guard in __main__ aborts if
+    ###! that ever fails, so here we bin on the integer radius directly.
+
+    Returns (idx2d (nx,nz), n_bins, kc_p (n_bins,), valid_p (n_bins,)), where
+    idx2d[ix,iz] is the radial bin of mode (ix,iz) and kc_p is the mean physical
+    |k| in each bin."""
+    kx = 2.0 * np.pi * np.fft.fftfreq(nx, d=Lx / nx)      ###! (nx,)
+    kz = 2.0 * np.pi * np.fft.fftfreq(nz, d=Lz / nz)      ###! (nz,)
+    KX, KZ = np.meshgrid(kx, kz, indexing="ij")           ###! (nx,nz)
+    kperp = np.sqrt(KX * KX + KZ * KZ)                     ###! (nx,nz)
+
+    k0 = 2.0 * np.pi / Lx                                  ###! == 2pi/Lz (square)
+    idx2d = np.floor(kperp / k0 + 0.5).astype(np.int64)    ###! (nx,nz) ring index
+    n_bins = int(idx2d.max()) + 1
+
+    flat_idx = idx2d.ravel()
+    flat_k = kperp.ravel()
+    counts = np.bincount(flat_idx, minlength=n_bins)
+    k_sum = np.bincount(flat_idx, weights=flat_k, minlength=n_bins)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        kc = np.where(counts > 0, k_sum / np.maximum(counts, 1), np.nan)
+
+    ###! isotropic Nyquist: only trust rings inside the inscribed circle of the
+    ###! 2D Nyquist square, i.e. |k| <= min(kny_x, kny_z). With a square grid
+    ###! these are equal.
+    kny = min(np.pi * nx / Lx, np.pi * nz / Lz)
+    valid = (counts > 0) & (kc <= kny) & (np.arange(n_bins) > 0)
+    return idx2d, n_bins, kc, valid
+
+
+def power_kxz_vector(field):
+    """0.5 * sum_i |F_i(kx,kz)|^2, y-averaged. `field` is a dict of 3 real
+    slabs (Gx-cropped, ny_slab, Gz-cropped). Returns (nx, nz) 2D power."""
     nx, ny_slab, nz = field[COMPONENTS[0]].shape
     norm = 1.0 / (nx * nz)
-    power_kxz = np.zeros((nx, nz), dtype=np.float64)
+    power = np.zeros((nx, nz), dtype=np.float64)
     for comp in COMPONENTS:
-        Bhat = np.fft.fft2(field[comp], axes=(0, 2)) * norm
-        power_kxz += 0.5 * (np.abs(Bhat) ** 2).mean(axis=1)
+        Fhat = np.fft.fft2(field[comp], axes=(0, 2)) * norm
+        power += 0.5 * (np.abs(Fhat) ** 2).mean(axis=1)
+    return power
+
+
+def power_kxz_scalar(arr):
+    """|F(kx,kz)|^2, y-averaged, for a SCALAR slab (nx, ny_slab, nz). No 1/2,
+    no component sum (scalar has no 'energy' convention). Returns (nx, nz)."""
+    nx, ny_slab, nz = arr.shape
+    norm = 1.0 / (nx * nz)
+    Fhat = np.fft.fft2(arr, axes=(0, 2)) * norm
+    return (np.abs(Fhat) ** 2).mean(axis=1)
+
+
+def reduce_axis(power_kxz, axis_lbl, idx, n_bins):
+    """Sum the 2D power onto one axis (marginal), then bin. axis 'x' -> keep kx
+    (sum over kz); 'z' -> keep kz (sum over kx)."""
     per_axis = power_kxz.sum(axis=1) if axis_lbl == "x" else power_kxz.sum(axis=0)
     return np.bincount(idx, weights=per_axis, minlength=n_bins)
+
+
+def reduce_radial(power_kxz, idx2d, n_bins):
+    """Annular sum: total power in each k_perp ring. idx2d is (nx,nz)."""
+    return np.bincount(idx2d.ravel(), weights=power_kxz.ravel(),
+                       minlength=n_bins)
 
 
 def build_sf_lags(n, max_frac):
@@ -223,7 +292,8 @@ def build_sf_lags(n, max_frac):
 
 def sf_moments(field, axis, lags, orders):
     """Raw structure-function moments <|df|^n> along one axis for each n in
-    `orders`. Returns dict n->array. axis: 0=x,1=y,2=z.
+    `orders`. Returns dict n->array. axis: 0=x,1=y,2=z. `field` is the magnetic
+    VECTOR dict (Bx,By,Bz); SF is on the vector increment magnitude, unchanged.
 
     ###! SPEED: this is the dominant cost of the compute stage, so three
     ###! micro-optimisations are applied, ALL exact for even n (which these are):
@@ -275,7 +345,7 @@ def sf_moments(field, axis, lags, orders):
     return out
 
 
-parser = argparse.ArgumentParser(description="MPI compute stage: write per-CS-averaged in-plane spectra E(kx),E(kz) and SF moments <|df|^n> (n=2,4,8) for B and dB to a .npz cache.")
+parser = argparse.ArgumentParser(description="MPI compute stage: write per-CS-averaged in-plane spectra E(kx),E(kz),E(kperp) for dB (vector), dJz and drho (per-species-summed scalars), plus SF moments <|df|^n> for B and dB, to a .npz cache.")
 parser.add_argument("dir_data", type=str)
 parser.add_argument("xmin", type=float); parser.add_argument("xmax", type=float)
 parser.add_argument("ymin", type=float); parser.add_argument("ymax", type=float)
@@ -286,6 +356,10 @@ parser.add_argument("--nzc", type=int, required=True)
 parser.add_argument("--cycle-start", type=int, default=0)
 parser.add_argument("--cycle-end", type=int, default=5000)
 parser.add_argument("--cycle-step", type=int, default=100)
+###! physical-time label per OUTPUT FRAME, as in rho_CS.py / B_J.py:
+###!   time = (cycle / cycle_step) * time_step
+###! (equals literal sim time cycle*dt only if time_step == cycle_step*dt).
+parser.add_argument("--time-step", type=float, default=100.0)
 parser.add_argument("--outdir", type=str, default=None)
 parser.add_argument("--cache-name", type=str, default="spectra_sf_cache.npz")
 parser.add_argument("--mapping", type=str, default="auto",
@@ -309,6 +383,24 @@ if rank == 0:
             raise RuntimeError(f"No proc*.hdf files found in {args.dir_data}")
         with h5py.File(all_files[0], "r") as f:
             tile_shape = tuple(f[f"fields/Bx/cycle_{args.cycle_start}"].shape)
+
+            ###! verify the per-species scalar moments exist and share the Bx
+            ###! tile shape (the shared-boundary assembly indexing is reused for
+            ###! them, so a shape mismatch would corrupt the assembled field).
+            probe_sp = ELECTRONS[0]
+            for qty in SCALAR_QTYS:
+                p = f"moments/species_{probe_sp}/{qty}/cycle_{args.cycle_start}"
+                if p not in f:
+                    raise KeyError(
+                        f"Expected per-species moment '{p}' not found. This "
+                        f"script needs moments/species_S/{{Jz,rho}} for "
+                        f"S in {sorted(set(ELECTRONS + PROTONS))}.")
+                ms = tuple(f[p].shape)
+                if ms != tile_shape:
+                    raise RuntimeError(
+                        f"Moment '{qty}' tile shape {ms} != Bx tile shape "
+                        f"{tile_shape}; shared assembly indexing would be wrong.")
+
         nx_t, ny_t, nz_t = tile_shape
         XLEN, YLEN, ZLEN = nxc // (nx_t-1), nyc // (ny_t-1), nzc // (nz_t-1)
         if XLEN * YLEN * ZLEN != len(all_files):
@@ -341,6 +433,16 @@ rank_to_ijk = mapping_candidates(XLEN, YLEN, ZLEN)[map_name]
 local_files = all_files[rank::size]
 G_shape = global_shape_shared(tile_shape, XLEN, YLEN, ZLEN)
 Gx, Gy, Gz = G_shape
+
+###! ------------------------------------------------------------------
+###! datasets to assemble each slab: the 3 B components + every per-species
+###! Jz and rho we will need. Keys are field-agnostic; the group summation
+###! happens after assembly on rank 0.
+DATASETS = {c: f"fields/{c}/{{cycle}}" for c in COMPONENTS}
+SPS = sorted(set(ELECTRONS + PROTONS))
+for s in SPS:
+    for qty in SCALAR_QTYS:
+        DATASETS[f"{qty}_s{s}"] = f"moments/species_{s}/{qty}/{{cycle}}"
 
 requested = list(range(args.cycle_start, args.cycle_end + 1, args.cycle_step))
 
@@ -379,36 +481,87 @@ nx_fft = Gx - 1
 nz_fft = Gz - 1
 
 if rank == 0:
+    ###! ---- square-grid guard for the k_perp (isotropic) reduction ----
+    ###! integer-radius annular binning is only a true constant-|k| annulus when
+    ###! Delta kx == Delta kz, i.e. Lx/nx_fft == Lz/nz_fft. Abort otherwise
+    ###! rather than silently distorting the isotropic slope.
+    dkx = 2.0 * np.pi / Lx
+    dkz = 2.0 * np.pi / Lz
+    if nx_fft != nz_fft or not np.isclose(dkx, dkz, rtol=1e-6):
+        raise SystemExit(
+            f"k_perp binning assumes a SQUARE in-plane grid (Delta kx == "
+            f"Delta kz). Got nx_fft={nx_fft}, nz_fft={nz_fft}, "
+            f"dkx={dkx:.6g}, dkz={dkz:.6g} (Lx={Lx:g}, Lz={Lz:g}). "
+            f"Refusing to mis-bin the isotropic spectrum.")
+
     idx_x, nbx, kcx, vx = build_axis_binning(nx_fft, Lx)
     idx_z, nbz, kcz, vz = build_axis_binning(nz_fft, Lz)
+    idx_p, nbp, kcp, vp = build_radial_binning(nx_fft, nz_fft, Lx, Lz)
     lags_x = build_sf_lags(nx_fft, max_frac=0.5)
     lags_z = build_sf_lags(nz_fft, max_frac=0.5)
     ny_slab0 = slab_ranges[0][1] - slab_ranges[0][0]
     lags_y = build_sf_lags(ny_slab0, max_frac=0.9)
 
-    ###! per-sheet accumulators (averaged at the end)
+    ###! spectral field tags: dB (vector) + the four per-species scalars.
+    ###! Each gets three reductions: _x (kx), _z (kz), _p (k_perp).
+    SPEC_TAGS = ["dB", "dJze", "dJzp", "dre", "drp"]
+
     def new_store():
-        return {"Ex_B": [], "Ez_B": [], "Ex_dB": [], "Ez_dB": [],
-                "SF_B": {n: {"x": [], "y": [], "z": []} for n in SF_ORDERS},
-                "SF_dB": {n: {"x": [], "y": [], "z": []} for n in SF_ORDERS}}
+        s = {"SF_B": {n: {"x": [], "y": [], "z": []} for n in SF_ORDERS},
+             "SF_dB": {n: {"x": [], "y": [], "z": []} for n in SF_ORDERS}}
+        for tag in SPEC_TAGS:
+            s[f"Ex_{tag}"] = []
+            s[f"Ez_{tag}"] = []
+            s[f"Ekp_{tag}"] = []
+        return s
     store = {cs: new_store() for cs in range(len(CS_SLABS))}
 
 ###! ---------------- main loop ----------------
 for cyc in cycle_names:
     for cs, (jlo, jhi) in enumerate(slab_ranges):
         slab = assemble_slab(cyc, local_files, rank_to_ijk, tile_shape,
-                             G_shape, jlo, jhi)
+                             G_shape, jlo, jhi, DATASETS)
         if rank != 0:
             continue
 
+        ###! ---- magnetic vector: crop shared duplicate plane, form B and dB ----
         B = {c: slab[c][:nx_fft, :, :nz_fft] for c in COMPONENTS}
-        dB = fluctuation_slab(B)
+        dB = fluctuation_vec(B)
 
-        store[cs]["Ex_B"].append(inplane_directional_spectrum(B, "x", idx_x, nbx))
-        store[cs]["Ez_B"].append(inplane_directional_spectrum(B, "z", idx_z, nbz))
-        store[cs]["Ex_dB"].append(inplane_directional_spectrum(dB, "x", idx_x, nbx))
-        store[cs]["Ez_dB"].append(inplane_directional_spectrum(dB, "z", idx_z, nbz))
+        ###! ---- per-species SUM-THEN-FFT for the scalar group moments ----
+        ###! group fluid moment = sum of species slabs (real space), cropped to
+        ###! the FFT grid, then fluctuation df = f - <f>_xz(y).
+        def group_scalar(qty, species):
+            acc = None
+            for s in species:
+                a = slab[f"{qty}_s{s}"][:nx_fft, :, :nz_fft]
+                acc = a.copy() if acc is None else acc + a
+            return acc
 
+        Jz_e = group_scalar("Jz", ELECTRONS)
+        Jz_p = group_scalar("Jz", PROTONS)
+        rho_e = group_scalar("rho", ELECTRONS)
+        rho_p = group_scalar("rho", PROTONS)
+
+        dJz_e = fluctuation_scalar(Jz_e)
+        dJz_p = fluctuation_scalar(Jz_p)
+        drho_e = fluctuation_scalar(rho_e)
+        drho_p = fluctuation_scalar(rho_p)
+
+        ###! ---- 2D power per field, then three reductions each ----
+        p_dB   = power_kxz_vector(dB)
+        p_dJze = power_kxz_scalar(dJz_e)
+        p_dJzp = power_kxz_scalar(dJz_p)
+        p_dre  = power_kxz_scalar(drho_e)
+        p_drp  = power_kxz_scalar(drho_p)
+
+        for tag, P in (("dB", p_dB), ("dJze", p_dJze), ("dJzp", p_dJzp),
+                       ("dre", p_dre), ("drp", p_drp)):
+            store[cs][f"Ex_{tag}"].append(reduce_axis(P, "x", idx_x, nbx))
+            store[cs][f"Ez_{tag}"].append(reduce_axis(P, "z", idx_z, nbz))
+            store[cs][f"Ekp_{tag}"].append(reduce_radial(P, idx_p, nbp))
+
+        ###! ---- SF moments on B and dB (unchanged) ----
         for tag, fld in (("SF_B", B), ("SF_dB", dB)):
             mx = sf_moments(fld, 0, lags_x, SF_ORDERS)
             my = sf_moments(fld, 1, lags_y, SF_ORDERS)
@@ -431,16 +584,13 @@ if rank == 0:
         b = np.array(store[1][tag][n][ax])
         return 0.5 * (a + b)
 
-    times = np.array([int(c.replace("cycle_", "")) * TIME_PER_CYCLE
-                      for c in cycle_names])
     cycles = np.array([int(c.replace("cycle_", "")) for c in cycle_names])
+    ###! physical-time label per output frame (rho_CS.py / B_J.py convention)
+    times = cycles / args.cycle_step * args.time_step
 
     save = dict(
-        # spectra (CS-averaged)
-        Ex_B=avg2("Ex_B"), Ez_B=avg2("Ez_B"),
-        Ex_dB=avg2("Ex_dB"), Ez_dB=avg2("Ez_dB"),
         # axes / masks
-        kc_x=kcx, valid_x=vx, kc_z=kcz, valid_z=vz,
+        kc_x=kcx, valid_x=vx, kc_z=kcz, valid_z=vz, kc_p=kcp, valid_p=vp,
         lags_x=lags_x, lags_y=lags_y, lags_z=lags_z,
         dx=Lx / nxc, dy=Ly / nyc, dz=Lz / nzc,
         cycles=cycles, times=times,
@@ -450,7 +600,16 @@ if rank == 0:
         grid=np.array([nxc, nyc, nzc]),
         box=np.array([Lx, Ly, Lz]),
         mapping=np.array([map_name], dtype=object),
+        electrons=np.array(ELECTRONS),
+        protons=np.array(PROTONS),
     )
+
+    ###! spectra (CS-averaged): dB + four per-species scalars, x/z/kperp each
+    for tag in SPEC_TAGS:
+        save[f"Ex_{tag}"] = avg2(f"Ex_{tag}")
+        save[f"Ez_{tag}"] = avg2(f"Ez_{tag}")
+        save[f"Ekp_{tag}"] = avg2(f"Ekp_{tag}")
+
     ###! SF moments: one array per (field, order, direction), CS-averaged
     for tag in ("SF_B", "SF_dB"):
         for n in SF_ORDERS:
@@ -460,7 +619,12 @@ if rank == 0:
     cache_path = os.path.join(outdir, args.cache_name)
     np.savez_compressed(cache_path, **save)
     print(f"Wrote cache: {cache_path}", flush=True)
-    print(f"  cycles={len(cycles)}  SF orders={SF_ORDERS}  "
-          f"(raw moments <|df|^n>, CS-averaged)", flush=True)
+    print(f"  cycles={len(cycles)}  spectra tags={SPEC_TAGS}", flush=True)
+    print(f"  reductions: Ex_ (kx), Ez_ (kz), Ekp_ (k_perp isotropic)",
+          flush=True)
+    print(f"  SF orders={SF_ORDERS} on B and dB (raw moments <|df|^n>, "
+          f"CS-averaged)", flush=True)
+    print(f"  per-species groups: electrons={ELECTRONS} protons={PROTONS} "
+          f"(summed before FFT)", flush=True)
 
 comm.Barrier()
