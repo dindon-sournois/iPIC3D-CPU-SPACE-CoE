@@ -136,6 +136,10 @@ class Collective
     double getPitchAngle(int nspecies)  const{ return (pitch_angle[nspecies]); }
     double getEnergy(int nspecies)      const{ return (energy[nspecies]); }
 
+    bool getCollapsedX() const { return collapsedX; }
+    bool getCollapsedY() const { return collapsedY; }
+    bool getCollapsedZ() const { return collapsedZ; }
+
     //? Nonperiodic boundaries
     int getBcPfaceXright()              const{ return (bcPfaceXright); }
     int getBcPfaceXleft()               const{ return (bcPfaceXleft); }
@@ -453,6 +457,11 @@ class Collective
     //* Particle distribution parameters
     int ParticleDistOutputCycle; int ParticleDistBins;
     double ParticleDistMinVelocity; double ParticleDistMaxVelocity;
+
+    //* whether each axis is collapsed (single cell)
+    bool collapsedX;
+    bool collapsedY;
+    bool collapsedZ;
 };
 typedef Collective CollectiveIO;
 

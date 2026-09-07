@@ -329,27 +329,25 @@ void Collective::ReadInput(string inputfile)
         nzc     = config.read <int>    ("nzc", 64);
     #endif
 
-    if (nzc == 1) 
+    //* Determine dimensionality and which axes are collapsed (singleton).
+    //* A collapsed axis has exactly one cell; the simulation is invariant
+    //* along it and particle coordinates on it are pinned (see fixPosition()).
+    if (nxc < 1 || nyc < 1 || nzc < 1)
     {
-        if (nyc == 1)
-            dim = 1;
-        else if (nxc > 1)
-            dim = 2;
-        else 
-        {
-            cout << "ERROR: A 1D case has to be along the X direction (nyc = 1 & nzc = 1)" << endl;
-            MPI_Abort(MPI_COMM_WORLD, -1);
-        }
-    } 
-    else 
+        cout << "ERROR: nxc, nyc, nzc must each be >= 1" << endl;
+        MPI_Abort(MPI_COMM_WORLD, -1);
+    }
+
+    collapsedX = (nxc == 1);
+    collapsedY = (nyc == 1);
+    collapsedZ = (nzc == 1);
+
+    dim = 3 - (collapsedX + collapsedY + collapsedZ);
+
+    if (dim == 0)
     {
-        if ((nyc > 1) && (nxc > 1))
-            dim = 3;
-        else 
-        {
-            cout << "ERROR: A 1D case has to be along the X direction (nyc = 1 & nzc = 1) and a 2D case has to be in the XY plane (nzc = 1)" << endl;
-            MPI_Abort(MPI_COMM_WORLD, -1);
-        }   
+        cout << "ERROR: All axes are singleton (nxc = nyc = nzc = 1); nothing to simulate" << endl;
+        MPI_Abort(MPI_COMM_WORLD, -1);
     }
 
     //* MPI totology

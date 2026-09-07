@@ -626,26 +626,28 @@ void Particles3D::ECSIM_position(Field *EMf)
 }
 
 //? Set particles' poitions to 0 along unused dimensions
+//? Set particles' positions to 0 along collapsed (inactive) dimensions
 void Particles3D::fixPosition()
 {
-    if (col->getDim() == 1) 
-    {    
-        for (int pidx = 0; pidx < getNOP(); pidx++) 
-        {
-            SpeciesParticle* pcl = &_pcls[pidx];
-		    ALIGNED(pcl);
-            pcl->set_y(0.0);
-            pcl->set_z(0.0);
-        }
-    } 
-    else if (col->getDim() == 2) 
+    //* Determine which axes are collapsed (singleton). A collapsed axis
+    //* must have all particle coordinates pinned to 0, matching the
+    //* single-cell geometry set up in Collective/Grid.
+    const bool fixX = col->getCollapsedX();
+    const bool fixY = col->getCollapsedY();
+    const bool fixZ = col->getCollapsedZ();
+
+    //* Nothing to do for a full 3D run
+    if (!fixX && !fixY && !fixZ)
+        return;
+
+    for (int pidx = 0; pidx < getNOP(); pidx++)
     {
-        for (int pidx = 0; pidx < getNOP(); pidx++) 
-        {
-            SpeciesParticle* pcl = &_pcls[pidx];
-		    ALIGNED(pcl);
-            pcl->set_z(0.0);
-        }
+        SpeciesParticle* pcl = &_pcls[pidx];
+        ALIGNED(pcl);
+
+        if (fixX) pcl->set_x(0.0);
+        if (fixY) pcl->set_y(0.0);
+        if (fixZ) pcl->set_z(0.0);
     }
 }
 
