@@ -2277,37 +2277,63 @@ void EMfields3D::sumMoments_vectorized_AoS(const Particles3Dcomm* part)
   }
 }
 
+static inline void mass_madd(
+    double& resX, double& resY, double& resZ,
+    double vx, double vy, double vz,
+    double mxx, double mxy, double mxz,
+    double myx, double myy, double myz,
+    double mzx, double mzy, double mzz)
+{
+    resX += vx * mxx + vy * myx + vz * mzx;
+    resY += vx * mxy + vy * myy + vz * mzy;
+    resZ += vx * mxz + vy * myz + vz * mzz;
+}
+
 //* Compute the product of mass matrix with vector "V = (Vx, Vy, Vz)"
 void EMfields3D::mass_matrix_times_vector(double* MEx, double* MEy, double* MEz, const_arr3_double vectX, const_arr3_double vectY, const_arr3_double vectZ, int i, int j, int k)
 {
-    double resX = 0.0; double resY = 0.0; double resZ = 0.0;
+    const double *vx  = vectX.get_arr();
+    const double *vy  = vectY.get_arr();
+    const double *vz  = vectZ.get_arr();
+    const double *mxx = Mxx.get_arr();
+    const double *mxy = Mxy.get_arr();
+    const double *mxz = Mxz.get_arr();
+    const double *myx = Myx.get_arr();
+    const double *myy = Myy.get_arr();
+    const double *myz = Myz.get_arr();
+    const double *mzx = Mzx.get_arr();
+    const double *mzy = Mzy.get_arr();
+    const double *mzz = Mzz.get_arr();
 
-    //* Center (g = 0)
-    resX  = vectX[i][j][k]*Mxx[0][i][j][k] + vectY[i][j][k]*Myx[0][i][j][k] + vectZ[i][j][k]*Mzx[0][i][j][k];
-    resY  = vectX[i][j][k]*Mxy[0][i][j][k] + vectY[i][j][k]*Myy[0][i][j][k] + vectZ[i][j][k]*Mzy[0][i][j][k];
-    resZ  = vectX[i][j][k]*Mxz[0][i][j][k] + vectY[i][j][k]*Myz[0][i][j][k] + vectZ[i][j][k]*Mzz[0][i][j][k];
+    size_t sz   = (size_t)nzn;
+    size_t syz  = (size_t)nyn * sz;
+    size_t sxyz = (size_t)nxn * syz;
+    size_t ijk  = (size_t)i * syz + (size_t)j * sz + (size_t)k;
 
-    //* Neighbours
-    for (int g = 1; g < NE_MASS; g++) 
+    double vx0 = vx[ijk];
+    double vy0 = vy[ijk];
+    double vz0 = vz[ijk];
+
+    double resX = vx0 * mxx[ijk] + vy0 * myx[ijk] + vz0 * mzx[ijk];
+    double resY = vx0 * mxy[ijk] + vy0 * myy[ijk] + vz0 * mzy[ijk];
+    double resZ = vx0 * mxz[ijk] + vy0 * myz[ijk] + vz0 * mzz[ijk];
+
+    #pragma unroll
+    for (int g = 1; g < NE_MASS; g++)
     {
-        int i1 = i + NeNo.getX(g);
-        int j1 = j + NeNo.getY(g);
-        int k1 = k + NeNo.getZ(g);
+        int di = NeNo.getX(g);
+        int dj = NeNo.getY(g);
+        int dk = NeNo.getZ(g);
 
-        resX += vectX[i1][j1][k1]*Mxx[g][i][j][k] + vectY[i1][j1][k1]*Myx[g][i][j][k] + vectZ[i1][j1][k1]*Mzx[g][i][j][k];
-        resY += vectX[i1][j1][k1]*Mxy[g][i][j][k] + vectY[i1][j1][k1]*Myy[g][i][j][k] + vectZ[i1][j1][k1]*Mzy[g][i][j][k];
-        resZ += vectX[i1][j1][k1]*Mxz[g][i][j][k] + vectY[i1][j1][k1]*Myz[g][i][j][k] + vectZ[i1][j1][k1]*Mzz[g][i][j][k];
+        size_t idx = (size_t)(i + di) * syz + (size_t)(j + dj) * sz + (size_t)(k + dk);
+        size_t Mg = (size_t)g * sxyz + ijk;
+        mass_madd(resX, resY, resZ, vx[idx], vy[idx], vz[idx],
+                  mxx[Mg], mxy[Mg], mxz[Mg], myx[Mg], myy[Mg], myz[Mg], mzx[Mg], mzy[Mg], mzz[Mg]);
 
-        // if (g == 0)
-        //     continue;
-        
-        int i2 = i - NeNo.getX(g);
-        int j2 = j - NeNo.getY(g);
-        int k2 = k - NeNo.getZ(g);
-
-        resX += vectX[i2][j2][k2]*Mxx[g][i2][j2][k2] + vectY[i2][j2][k2]*Myx[g][i2][j2][k2] + vectZ[i2][j2][k2]*Mzx[g][i2][j2][k2];
-        resY += vectX[i2][j2][k2]*Mxy[g][i2][j2][k2] + vectY[i2][j2][k2]*Myy[g][i2][j2][k2] + vectZ[i2][j2][k2]*Mzy[g][i2][j2][k2];
-        resZ += vectX[i2][j2][k2]*Mxz[g][i2][j2][k2] + vectY[i2][j2][k2]*Myz[g][i2][j2][k2] + vectZ[i2][j2][k2]*Mzz[g][i2][j2][k2];
+        idx = (size_t)(i - di) * syz + (size_t)(j - dj) * sz + (size_t)(k - dk);
+        Mg = (size_t)g * sxyz + idx;
+        mass_madd(resX, resY, resZ, vx[idx], vy[idx], vz[idx],
+                  mxx[Mg], mxy[Mg], mxz[Mg], myx[Mg], myy[Mg], myz[Mg], mzx[Mg], mzy[Mg], mzz[Mg]);
     }
 
     *MEx = resX;
