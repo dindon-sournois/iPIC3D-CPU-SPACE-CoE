@@ -2290,7 +2290,7 @@ static inline void mass_madd(
 }
 
 //* Compute the product of mass matrix with vector "V = (Vx, Vy, Vz)"
-void EMfields3D::mass_matrix_times_vector(double* MEx, double* MEy, double* MEz, const_arr3_double vectX, const_arr3_double vectY, const_arr3_double vectZ, int i, int j, int k)
+void EMfields3D::mass_matrix_times_vector(double* MEx, double* MEy, double* MEz, const_arr3_double vectX, const_arr3_double vectY, const_arr3_double vectZ, int i, int j, int k, const int *mass_dx, const int *mass_dy, const int *mass_dz)
 {
     const double *vx  = vectX.get_arr();
     const double *vy  = vectY.get_arr();
@@ -2321,9 +2321,9 @@ void EMfields3D::mass_matrix_times_vector(double* MEx, double* MEy, double* MEz,
     #pragma unroll
     for (int g = 1; g < NE_MASS; g++)
     {
-        int di = NeNo.getX(g);
-        int dj = NeNo.getY(g);
-        int dk = NeNo.getZ(g);
+        int di = mass_dx[g];
+        int dj = mass_dy[g];
+        int dk = mass_dz[g];
 
         size_t idx = (size_t)(i + di) * syz + (size_t)(j + dj) * sz + (size_t)(k + dk);
         size_t Mg = (size_t)g * sxyz + ijk;
@@ -2789,6 +2789,17 @@ void EMfields3D::MaxwellSource(double *bkrylov)
     phys2solver(bkrylov, tempX, tempY, tempZ, nxn, nyn, nzn);
 }
 
+//* Copy neighbour offsets from NeighbouringNodes
+static void fill_mass_stencil(NeighbouringNodes& NeNo, int dx[NE_MASS], int dy[NE_MASS], int dz[NE_MASS])
+{
+    for (int g = 0; g < NE_MASS; g++)
+    {
+        dx[g] = NeNo.getX(g);
+        dy[g] = NeNo.getY(g);
+        dz[g] = NeNo.getZ(g);
+    }
+}
+
 //? RHS of the Maxwell solver
 //
 // In the field solver, there is one layer of ghost cells. The nodes on the ghost cells define two outer layers of nodes: the
@@ -2870,6 +2881,11 @@ void EMfields3D::MaxwellImage(double *im, double* vector)
     //* Energy-conserving smoothing (BC nodes are taken care of in the smoothing process)
     energy_conserve_smooth(tempX, tempY, tempZ, nxn, nyn, nzn);
 
+    int mass_dx[NE_MASS];
+    int mass_dy[NE_MASS];
+    int mass_dz[NE_MASS];
+    fill_mass_stencil(NeNo, mass_dx, mass_dy, mass_dz);
+
     #pragma omp parallel for collapse(3) schedule(static)
     for (int i=1; i<nxn-1; i++) 
         for (int j=1; j<nyn-1; j++) 
@@ -2877,7 +2893,8 @@ void EMfields3D::MaxwellImage(double *im, double* vector)
             {
                 double MEx, MEy, MEz;
                 
-                mass_matrix_times_vector(&MEx, &MEy, &MEz, tempX, tempY, tempZ, i, j, k);
+                mass_matrix_times_vector(&MEx, &MEy, &MEz, tempX, tempY, tempZ, i, j, k,
+                                         mass_dx, mass_dy, mass_dz);
                 
                 temp2X[i][j][k] = dt*th*FourPI*MEx;
                 temp2Y[i][j][k] = dt*th*FourPI*MEy;

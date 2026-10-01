@@ -118,7 +118,7 @@ public:
     void C2NB();
 
     //* Compute the product of mass matrix with vector "V = (Vx, Vy, Vz)"
-    void mass_matrix_times_vector(double* MEx, double* MEy, double* MEz, const_arr3_double vectX, const_arr3_double vectY, const_arr3_double vectZ, int i, int j, int k);
+    void mass_matrix_times_vector(double* MEx, double* MEy, double* MEz, const_arr3_double vectX, const_arr3_double vectY, const_arr3_double vectZ, int i, int j, int k, const int *mass_dx, const int *mass_dy, const int *mass_dz);
 
     //* Energy-conserving smoothing
     void energy_conserve_smooth(arr3_double data_X, arr3_double data_Y, arr3_double data_Z, int nx, int ny, int nz);
