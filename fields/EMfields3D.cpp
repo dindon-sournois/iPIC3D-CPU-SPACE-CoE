@@ -340,10 +340,10 @@ EMfields3D::EMfields3D(Collective * col, Grid * grid, VirtualTopology3D *vct) :
 
     int count = 0;
 
-    for (int i = 0; i < 2; i++)
-    for (int j = 0; j < 2; j++)
-    for (int k = 0; k < 2; k++)
     for (int n_node = 0; n_node < 14; n_node++)
+    for (int i = 1; i >= 0; i--)
+    for (int j = 1; j >= 0; j--)
+    for (int k = 1; k >= 0; k--)
     {
         const int i2 = i - NeNo.getX(n_node);
         const int j2 = j - NeNo.getY(n_node);
