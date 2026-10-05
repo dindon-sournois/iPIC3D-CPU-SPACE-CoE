@@ -2292,18 +2292,18 @@ static inline void mass_madd(
 //* Compute the product of mass matrix with vector "V = (Vx, Vy, Vz)"
 void EMfields3D::mass_matrix_times_vector(double* MEx, double* MEy, double* MEz, const_arr3_double vectX, const_arr3_double vectY, const_arr3_double vectZ, int i, int j, int k, const int *mass_dx, const int *mass_dy, const int *mass_dz)
 {
-    const double *vx  = vectX.get_arr();
-    const double *vy  = vectY.get_arr();
-    const double *vz  = vectZ.get_arr();
-    const double *mxx = Mxx.get_arr();
-    const double *mxy = Mxy.get_arr();
-    const double *mxz = Mxz.get_arr();
-    const double *myx = Myx.get_arr();
-    const double *myy = Myy.get_arr();
-    const double *myz = Myz.get_arr();
-    const double *mzx = Mzx.get_arr();
-    const double *mzy = Mzy.get_arr();
-    const double *mzz = Mzz.get_arr();
+    const double *const __restrict__ vx  = vectX.get_arr();
+    const double *const __restrict__ vy  = vectY.get_arr();
+    const double *const __restrict__ vz  = vectZ.get_arr();
+    const double *const __restrict__ mxx = Mxx.get_arr();
+    const double *const __restrict__ mxy = Mxy.get_arr();
+    const double *const __restrict__ mxz = Mxz.get_arr();
+    const double *const __restrict__ myx = Myx.get_arr();
+    const double *const __restrict__ myy = Myy.get_arr();
+    const double *const __restrict__ myz = Myz.get_arr();
+    const double *const __restrict__ mzx = Mzx.get_arr();
+    const double *const __restrict__ mzy = Mzy.get_arr();
+    const double *const __restrict__ mzz = Mzz.get_arr();
 
     size_t sz   = (size_t)nzn;
     size_t syz  = (size_t)nyn * sz;

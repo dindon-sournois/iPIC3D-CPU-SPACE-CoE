@@ -611,9 +611,9 @@ private:
     //* Object of class to handle which nodes have to be computed when the mass matrix is calculated
     NeighbouringNodes NeNo;
 
-    size_t mass_offset[NUM_MASS_NODES];
-    int mass_w1[NUM_MASS_NODES];
-    int mass_w2[NUM_MASS_NODES];
+    size_t mass_offset[NUM_MASS_NODES] ALLOC_ALIGNED;
+    int mass_w1[NUM_MASS_NODES] ALLOC_ALIGNED;
+    int mass_w2[NUM_MASS_NODES] ALLOC_ALIGNED;
 
     /*! Field Boundary Condition
       0 = Dirichlet Boundary Condition: specifies the
@@ -909,15 +909,25 @@ inline void EMfields3D::add_Qyyz(double weight[8], int X, int Y, int Z, int is)
 //* Add an amount of current density to mass matrix field at node X,Y,Z *//
 inline void EMfields3D::add_Mass(double value[3][3], const double weights[8], int X, int Y, int Z)
 {
-    double *mxx = Mxx.fetch_arr();
-    double *mxy = Mxy.fetch_arr();
-    double *mxz = Mxz.fetch_arr();
-    double *myx = Myx.fetch_arr();
-    double *myy = Myy.fetch_arr();
-    double *myz = Myz.fetch_arr();
-    double *mzx = Mzx.fetch_arr();
-    double *mzy = Mzy.fetch_arr();
-    double *mzz = Mzz.fetch_arr();
+    double *const __restrict__ mxx = Mxx.fetch_arr();
+    double *const __restrict__ mxy = Mxy.fetch_arr();
+    double *const __restrict__ mxz = Mxz.fetch_arr();
+    double *const __restrict__ myx = Myx.fetch_arr();
+    double *const __restrict__ myy = Myy.fetch_arr();
+    double *const __restrict__ myz = Myz.fetch_arr();
+    double *const __restrict__ mzx = Mzx.fetch_arr();
+    double *const __restrict__ mzy = Mzy.fetch_arr();
+    double *const __restrict__ mzz = Mzz.fetch_arr();
+
+    ASSUME_ALIGNED(mxx);
+    ASSUME_ALIGNED(mxy);
+    ASSUME_ALIGNED(mxz);
+    ASSUME_ALIGNED(myx);
+    ASSUME_ALIGNED(myy);
+    ASSUME_ALIGNED(myz);
+    ASSUME_ALIGNED(mzx);
+    ASSUME_ALIGNED(mzy);
+    ASSUME_ALIGNED(mzz);
 
     const size_t base = ((size_t)X*nyn + Y)*nzn + Z;
 
