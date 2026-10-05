@@ -925,11 +925,17 @@ inline void EMfields3D::add_Mass(double value[3][3], const double weights[8], in
     const double vyx = value[1][0], vyy = value[1][1], vyz = value[1][2];
     const double vzx = value[2][0], vzy = value[2][1], vzz = value[2][2];
 
+    double ww[NUM_MASS_NODES];
+
+    #pragma omp simd
+    for (int n = 0; n < NUM_MASS_NODES; n++)
+        ww[n] = weights[mass_w1[n]] * weights[mass_w2[n]];
+
     #pragma omp simd
     for (int n = 0; n < NUM_MASS_NODES; n++)
     {
         const size_t idx = base + mass_offset[n];
-        const double w = weights[mass_w1[n]] * weights[mass_w2[n]];
+        const double w = ww[n];
 
         mxx[idx] += vxx*w;  mxy[idx] += vxy*w;  mxz[idx] += vxz*w;
         myx[idx] += vyx*w;  myy[idx] += vyy*w;  myz[idx] += vyz*w;
