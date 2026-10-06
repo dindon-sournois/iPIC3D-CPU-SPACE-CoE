@@ -179,7 +179,7 @@ public:
     void add_Jyh(double weight[8], int X, int Y, int Z, int is);
     void add_Jzh(double weight[8], int X, int Y, int Z, int is);
 
-    void add_Mass(double value[3][3], double w, size_t offset, int X, int Y, int Z);
+    void add_Mass(double value[3][3], const double weights[8], int X, int Y, int Z);
 
     //* ECSIM/RelSIM supplementary moments
     void add_Jx(double weight[8], int X, int Y, int Z, int is);
@@ -466,10 +466,6 @@ public: // accessors
     const Grid& get_grid()const{return _grid;};
     const VirtualTopology3D& get_vct()const{return _vct;}
 
-    size_t mass_offset[NUM_MASS_NODES];
-    int mass_w1[NUM_MASS_NODES];
-    int mass_w2[NUM_MASS_NODES];
-
     //* ********************************* VARIABLES ********************************* *//
     
 private:
@@ -614,6 +610,10 @@ private:
 
     //* Object of class to handle which nodes have to be computed when the mass matrix is calculated
     NeighbouringNodes NeNo;
+
+    size_t mass_offset[NUM_MASS_NODES];
+    int mass_w1[NUM_MASS_NODES];
+    int mass_w2[NUM_MASS_NODES];
 
     /*! Field Boundary Condition
       0 = Dirichlet Boundary Condition: specifies the
@@ -907,7 +907,7 @@ inline void EMfields3D::add_Qyyz(double weight[8], int X, int Y, int Z, int is)
 }
 
 //* Add an amount of current density to mass matrix field at node X,Y,Z *//
-inline void EMfields3D::add_Mass(double value[3][3], double w, size_t offset, int X, int Y, int Z)
+inline void EMfields3D::add_Mass(double value[3][3], const double weights[8], int X, int Y, int Z)
 {
     double *mxx = Mxx.fetch_arr();
     double *mxy = Mxy.fetch_arr();
@@ -919,15 +919,22 @@ inline void EMfields3D::add_Mass(double value[3][3], double w, size_t offset, in
     double *mzy = Mzy.fetch_arr();
     double *mzz = Mzz.fetch_arr();
 
-    const size_t idx = ((size_t)X*nyn + Y)*nzn + Z + offset;
+    const size_t base = ((size_t)X*nyn + Y)*nzn + Z;
 
     const double vxx = value[0][0], vxy = value[0][1], vxz = value[0][2];
     const double vyx = value[1][0], vyy = value[1][1], vyz = value[1][2];
     const double vzx = value[2][0], vzy = value[2][1], vzz = value[2][2];
 
-    mxx[idx] += vxx*w;  mxy[idx] += vxy*w;  mxz[idx] += vxz*w;
-    myx[idx] += vyx*w;  myy[idx] += vyy*w;  myz[idx] += vyz*w;
-    mzx[idx] += vzx*w;  mzy[idx] += vzy*w;  mzz[idx] += vzz*w;
+    #pragma omp simd
+    for (int n = 0; n < NUM_MASS_NODES; n++)
+    {
+        const size_t idx = base + mass_offset[n];
+        const double w = weights[mass_w1[n]] * weights[mass_w2[n]];
+
+        mxx[idx] += vxx*w;  mxy[idx] += vxy*w;  mxz[idx] += vxz*w;
+        myx[idx] += vyx*w;  myy[idx] += vyy*w;  myz[idx] += vyz*w;
+        mzx[idx] += vzx*w;  mzy[idx] += vzy*w;  mzz[idx] += vzz*w;
+    }
 }
 
 inline void get_field_components_for_cell(const double* field_components[8], const_arr4_double fieldForPcls, int cx, int cy, int cz)

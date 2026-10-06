@@ -886,12 +886,7 @@ void Particles3D::computeMoments(Field *EMf)
               for (int ind2 = 0; ind2 < 3; ind2++)
                 value[ind1][ind2] = alpha[ind2][ind1] * qq;
 
-            for (int n = 0; n < NUM_MASS_NODES; n++)
-            {
-                size_t idx = EMf->mass_offset[n];
-                double ww = weights[EMf->mass_w1[n]] * weights[EMf->mass_w2[n]];
-                EMf->add_Mass(value, ww, idx, ix, iy, iz);
-            }
+            EMf->add_Mass(value, weights, ix, iy, iz);
 
             #ifdef __PROFILE_MOMENTS__
             time_mm.stop();
